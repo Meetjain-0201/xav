@@ -1,16 +1,18 @@
 """
-h6_cyclist_crossing.py — Cyclist crosses intersection; ego emergency-brakes.
+h6_cyclist_crossing.py
+Critical event: bicycle crosses road at tick ~200 (t≈10s); ego brakes for 1.4s.
 
 Criticality: HIGH
 Map: Town03
 Duration: 20 s
 
-Determinism guarantee:
-1. All TLs frozen GREEN — ego approaches at 35 km/h unimpeded
-2. Cyclist spawned 22 m ahead, 5 m to the right, facing perpendicular (crossing dir)
-3. At trigger: cyclist TM set to cross (ignore lights); simultaneously ap.override()
-   forces ego brake=0.8 for 1.4 s
-4. Speed gate ensures ego is moving when brake fires
+Implementation notes:
+- Cyclist (vehicle blueprint) spawned 22 m ahead, 5 m to the right, facing perpendicular
+- At trigger: direct VehicleControl(throttle=0.5) applied each tick to drive it across
+  (NOT TM autopilot — TM may not navigate across the road)
+- ap.override() forces ego brake=0.8 for 28 ticks simultaneously
+- Cyclist control reapplied every tick after trigger (same as walker pattern)
+- All TLs frozen GREEN; speed gate ensures ego is moving before event fires
 """
 import sys
 from pathlib import Path
@@ -29,7 +31,7 @@ FALLBACK_S    = 12.0
 
 
 def _dest(world, ego, dist_m=500.0):
-    wp = world.get_map().get_waypoint(ego.get_location())
+    wp  = world.get_map().get_waypoint(ego.get_location())
     wps = wp.next(dist_m)
     return wps[0].transform.location if wps \
         else world.get_map().get_spawn_points()[-1].location
@@ -46,14 +48,13 @@ class H6CyclistCrossing(ScenarioBase):
             tl.set_state(carla.TrafficLightState.Green)
             tl.freeze(True)
 
-        # Find a bicycle blueprint
-        bp_lib = self.world.get_blueprint_library()
+        # Find a bicycle/bike blueprint
+        bp_lib     = self.world.get_blueprint_library()
         cyclist_bp = None
         for name in ("vehicle.gazelle.omafiets", "vehicle.bh.crossbike",
                      "vehicle.diamondback.century"):
             try:
-                cyclist_bp = bp_lib.find(name)
-                break
+                cyclist_bp = bp_lib.find(name); break
             except Exception:
                 continue
         if cyclist_bp is None:
@@ -61,23 +62,22 @@ class H6CyclistCrossing(ScenarioBase):
                      if any(k in b.id for k in ("bike", "cycle", "cross", "gazelle"))]
             cyclist_bp = bikes[0] if bikes else bp_lib.filter("vehicle.*")[0]
 
-        # Spawn cyclist 22 m ahead, 5 m to the right, facing perpendicular
-        ego_wp    = self.world.get_map().get_waypoint(self.ego.get_location())
-        ahead_wps = ego_wp.next(22.0)
-        cyclist = None
-        if ahead_wps:
-            fwd   = ahead_wps[0].transform.get_forward_vector()
-            right = carla.Vector3D(x=-fwd.y, y=fwd.x, z=0.0)
-            loc   = (
-                ahead_wps[0].transform.location
-                + carla.Location(x=right.x * 5.0, y=right.y * 5.0, z=0.3)
-            )
-            cyclist_rot = carla.Rotation(
-                yaw=ahead_wps[0].transform.rotation.yaw + 90
-            )
-            cyclist = self.world.try_spawn_actor(
-                cyclist_bp, carla.Transform(loc, cyclist_rot)
-            )
+        # Spawn cyclist 22 m ahead, 5 m to the right, facing PERPENDICULAR to road
+        # Use actual spawn transform for reliable positioning
+        spawn_points = self.world.get_map().get_spawn_points()
+        ego_t   = spawn_points[self.spawn_index]
+        fwd     = ego_t.get_forward_vector()
+        right   = ego_t.get_right_vector()
+        cyclist_loc = carla.Location(
+            x = ego_t.location.x + 22.0 * fwd.x + 5.0 * right.x,
+            y = ego_t.location.y + 22.0 * fwd.y + 5.0 * right.y,
+            z = ego_t.location.z + 0.3,
+        )
+        # Face 90° to the right of ego's forward = crossing direction
+        cyclist_rot = carla.Rotation(yaw=ego_t.rotation.yaw + 90)
+        cyclist     = self.world.try_spawn_actor(
+            cyclist_bp, carla.Transform(cyclist_loc, cyclist_rot)
+        )
 
         if ap is None:
             ap = AgentController(self.ego, self.world,
@@ -96,6 +96,7 @@ class H6CyclistCrossing(ScenarioBase):
         try:
             start = self.world.get_snapshot().timestamp.elapsed_seconds
             elapsed = 0.0
+
             while elapsed < DURATION:
                 frame   = self.tick()
                 ap.update(frame)
@@ -110,27 +111,34 @@ class H6CyclistCrossing(ScenarioBase):
 
                 if fire:
                     critical_triggered = True
-                    # Cyclist crosses — TM with full throttle, ignore lights
-                    if cyclist and cyclist.is_alive:
-                        cyclist.set_autopilot(True, self.traffic_manager.get_port())
-                        self.traffic_manager.ignore_lights_percentage(cyclist, 100)
-                        self.traffic_manager.vehicle_percentage_speed_difference(cyclist, -80)
-                    # Ego emergency-brakes
+                    # Cyclist crosses using direct VehicleControl each tick
                     with ap.override():
                         for _ in range(28):   # ~1.4 s
                             self.ego.apply_control(
                                 carla.VehicleControl(brake=0.8, throttle=0.0)
                             )
+                            if cyclist and cyclist.is_alive:
+                                cyclist.apply_control(
+                                    carla.VehicleControl(throttle=0.5, steer=0.0,
+                                                         brake=0.0)
+                                )
                             frame   = self.tick()
                             ap.update(frame)
                             rec.record(frame)
                             elapsed = frame["timestamp"] - start
 
+                # Keep cyclist rolling after override ends
+                elif critical_triggered and cyclist and cyclist.is_alive:
+                    cyclist.apply_control(
+                        carla.VehicleControl(throttle=0.4, steer=0.0, brake=0.0)
+                    )
+
         finally:
             if _owns_rec:
                 rec.__exit__(None, None, None)
 
-        if cyclist and cyclist.is_alive: cyclist.destroy()
+        if cyclist and cyclist.is_alive:
+            cyclist.destroy()
         ap.disable()
 
         return {
@@ -146,7 +154,7 @@ class H6CyclistCrossing(ScenarioBase):
                    if e["trigger_type"] == "BRAKING"]
         if not braking:
             raise ScenarioFailed(
-                f"{self.scenario_id}: expected BRAKING trigger. "
+                f"{self.scenario_id}: BRAKING trigger required. "
                 f"Got: {[e['trigger_type'] for e in self._action_events]}"
             )
 

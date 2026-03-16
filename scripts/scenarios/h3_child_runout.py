@@ -1,14 +1,16 @@
 """
-h3_child_runout.py — Child runs out from sidewalk; ego emergency-brakes.
+h3_child_runout.py
+Critical event: child runs into road at tick ~200 (t≈10s); ego hard-brakes for 2s.
 
 Criticality: HIGH
-Map: Town02  (narrow urban streets, lower speed limit)
+Map: Town02  (narrow urban streets, lower speeds)
 Duration: 20 s
 
-Same pattern as H1 but:
-- Town02 narrow streets
-- Preferred child blueprint (walker.pedestrian.0008 / 0012 / 0013)
-- Walker placed 18 m ahead, 3.5 m offset to the right
+Same approach as H1:
+- Child blueprint selected by ID (shorter pedestrian models)
+- Walker spawn from ego's actual spawn transform (NOT nav-mesh)
+- WalkerControl reapplied EVERY tick after trigger
+- All TLs frozen GREEN; ap.override() forces brake=1.0 for 40 ticks
 """
 import sys
 from pathlib import Path
@@ -25,9 +27,17 @@ MIN_SPEED_KMH = 10.0
 WARMUP_S      =  4.0
 FALLBACK_S    = 11.0
 
+# CARLA child/shorter pedestrian blueprint IDs
+_CHILD_IDS = (
+    "walker.pedestrian.0008",
+    "walker.pedestrian.0012",
+    "walker.pedestrian.0014",
+    "walker.pedestrian.0016",
+)
+
 
 def _dest(world, ego, dist_m=400.0):
-    wp = world.get_map().get_waypoint(ego.get_location())
+    wp  = world.get_map().get_waypoint(ego.get_location())
     wps = wp.next(dist_m)
     return wps[0].transform.location if wps \
         else world.get_map().get_spawn_points()[-1].location
@@ -44,28 +54,33 @@ class H3ChildRunout(ScenarioBase):
             tl.set_state(carla.TrafficLightState.Green)
             tl.freeze(True)
 
-        # Prefer a child-sized pedestrian blueprint
-        bp_lib   = self.world.get_blueprint_library()
-        child_ids = ("0008", "0012", "0013", "0014")
+        # --- Select child blueprint ---
+        bp_lib    = self.world.get_blueprint_library()
         child_bps = [b for b in bp_lib.filter("walker.pedestrian.*")
-                     if any(cid in b.id for cid in child_ids)]
+                     if b.id in _CHILD_IDS]
         walker_bp = child_bps[0] if child_bps else \
                     (list(bp_lib.filter("walker.pedestrian.*")) or [None])[0]
 
-        walker   = None
-        walk_dir = carla.Vector3D(x=-1.0, y=0.0, z=0.0)
+        # --- Spawn location from ego's actual spawn transform ---
+        spawn_points = self.world.get_map().get_spawn_points()
+        ego_t   = spawn_points[self.spawn_index]
+        fwd     = ego_t.get_forward_vector()
+        right   = ego_t.get_right_vector()
+        walker_loc = carla.Location(
+            x = ego_t.location.x + 18.0 * fwd.x - 3.0 * right.x,
+            y = ego_t.location.y + 18.0 * fwd.y - 3.0 * right.y,
+            z = ego_t.location.z + 0.5,
+        )
+        walk_dir = carla.Vector3D(x=-right.x, y=-right.y, z=0.0)
 
-        ego_wp    = self.world.get_map().get_waypoint(self.ego.get_location())
-        ahead_wps = ego_wp.next(18.0)
-        if walker_bp and ahead_wps:
-            fwd   = ahead_wps[0].transform.get_forward_vector()
-            right = carla.Vector3D(x=-fwd.y, y=fwd.x, z=0.0)
-            loc   = (
-                ahead_wps[0].transform.location
-                + carla.Location(x=right.x * 3.5, y=right.y * 3.5, z=0.5)
+        walker = None
+        if walker_bp:
+            walker = self.world.try_spawn_actor(
+                walker_bp,
+                carla.Transform(walker_loc, carla.Rotation(yaw=ego_t.rotation.yaw + 90)),
             )
-            walker   = self.world.try_spawn_actor(walker_bp, carla.Transform(loc))
-            walk_dir = carla.Vector3D(x=-right.x, y=-right.y, z=0.0)
+            if walker:
+                self.world.tick()
 
         if ap is None:
             ap = AgentController(self.ego, self.world,
@@ -84,6 +99,7 @@ class H3ChildRunout(ScenarioBase):
         try:
             start = self.world.get_snapshot().timestamp.elapsed_seconds
             elapsed = 0.0
+
             while elapsed < DURATION:
                 frame   = self.tick()
                 ap.update(frame)
@@ -98,26 +114,35 @@ class H3ChildRunout(ScenarioBase):
 
                 if fire:
                     critical_triggered = True
-                    if walker and walker.is_alive:
-                        walker.apply_control(carla.WalkerControl(
-                            speed=3.5,
-                            direction=walk_dir,
-                        ))
                     with ap.override():
-                        for _ in range(30):
+                        for _ in range(40):
                             self.ego.apply_control(
                                 carla.VehicleControl(brake=1.0, throttle=0.0)
                             )
+                            if walker and walker.is_alive:
+                                walker.apply_control(carla.WalkerControl(
+                                    direction=walk_dir,
+                                    speed=3.5,
+                                    jump=False,
+                                ))
                             frame   = self.tick()
                             ap.update(frame)
                             rec.record(frame)
                             elapsed = frame["timestamp"] - start
 
+                elif critical_triggered and walker and walker.is_alive:
+                    walker.apply_control(carla.WalkerControl(
+                        direction=walk_dir,
+                        speed=3.5,
+                        jump=False,
+                    ))
+
         finally:
             if _owns_rec:
                 rec.__exit__(None, None, None)
 
-        if walker and walker.is_alive: walker.destroy()
+        if walker and walker.is_alive:
+            walker.destroy()
         ap.disable()
 
         return {
@@ -133,7 +158,7 @@ class H3ChildRunout(ScenarioBase):
                    if e["trigger_type"] == "BRAKING"]
         if not braking:
             raise ScenarioFailed(
-                f"{self.scenario_id}: expected BRAKING trigger. "
+                f"{self.scenario_id}: BRAKING trigger required. "
                 f"Got: {[e['trigger_type'] for e in self._action_events]}"
             )
 

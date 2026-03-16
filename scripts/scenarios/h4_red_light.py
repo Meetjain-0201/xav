@@ -1,15 +1,19 @@
 """
-h4_red_light.py — Ego approaches intersection; light turns RED; ego emergency-brakes.
+h4_red_light.py
+Critical event: traffic light turns RED at t≈8s; ego hard-brakes for 2s.
 
 Criticality: HIGH
 Map: Town03
 Duration: 20 s
 
-Determinism guarantee:
-1. All TLs start GREEN and frozen — ego approaches intersection at full speed
-2. At t=8s: find nearest TL to ego, unfreeze it, set RED (hold 10 s)
-3. ap.override() forces ego brake=1.0 for 2 s simultaneously to guarantee BRAKING
-4. After RED hold, set TL GREEN so ego can continue
+Implementation notes:
+- All TLs frozen GREEN at start so BasicAgent approaches at 40 km/h
+- At TL_TRIGGER_S: check ego.is_at_traffic_light() first (most reliable);
+  fall back to nearest TL by distance
+- TL frozen RED via set_state + freeze(True)
+- ap.override() simultaneously forces brake=1.0 for 40 ticks regardless of
+  whether BasicAgent would brake on its own (guarantees BRAKING trigger)
+- After RED_HOLD_S, TL reset GREEN so ego can continue if scenario duration allows
 """
 import sys
 from pathlib import Path
@@ -25,12 +29,11 @@ TARGET_KMH    = 40.0
 MIN_SPEED_KMH = 15.0
 TL_TRIGGER_S  =  8.0
 RED_HOLD_S    = 10.0
-WARMUP_S      =  3.0
 FALLBACK_S    = 13.0
 
 
 def _dest(world, ego, dist_m=500.0):
-    wp = world.get_map().get_waypoint(ego.get_location())
+    wp  = world.get_map().get_waypoint(ego.get_location())
     wps = wp.next(dist_m)
     return wps[0].transform.location if wps \
         else world.get_map().get_spawn_points()[-1].location
@@ -44,7 +47,7 @@ class H4RedLight(ScenarioBase):
         self.world.set_weather(carla.WeatherParameters.WetCloudyNoon)
 
         tl_actors = list(self.world.get_actors().filter("traffic.traffic_light"))
-        # Start all green (ego approaches at speed)
+        # Freeze all green so ego approaches at speed
         for tl in tl_actors:
             tl.set_state(carla.TrafficLightState.Green)
             tl.freeze(True)
@@ -52,7 +55,7 @@ class H4RedLight(ScenarioBase):
         if ap is None:
             ap = AgentController(self.ego, self.world,
                                  target_speed_kmh=TARGET_KMH,
-                                 ignore_traffic_lights=True)  # we control TL manually
+                                 ignore_traffic_lights=True)   # we control TL manually
             ap.set_destination(_dest(self.world, self.ego))
         ap.enable()
 
@@ -62,32 +65,40 @@ class H4RedLight(ScenarioBase):
             _owns_rec = False
 
         critical_triggered = False
-        tl_set_red         = False
         forced_tl          = None
+        tl_trigger_elapsed = None
 
         try:
             start = self.world.get_snapshot().timestamp.elapsed_seconds
             elapsed = 0.0
+
             while elapsed < DURATION:
                 frame   = self.tick()
                 ap.update(frame)
                 rec.record(frame)
                 elapsed = frame["timestamp"] - start
 
-                # At TL_TRIGGER_S set nearest TL to RED
-                if not tl_set_red and elapsed >= TL_TRIGGER_S:
-                    tl_set_red = True
-                    ego_loc = self.ego.get_location()
-                    if tl_actors:
-                        forced_tl = min(
-                            tl_actors,
-                            key=lambda tl: tl.get_location().distance(ego_loc),
-                        )
-                        forced_tl.freeze(False)
-                        forced_tl.set_state(carla.TrafficLightState.Red)
-                        forced_tl.set_red_time(RED_HOLD_S)
+                # --- Step 1: set nearest TL to RED at TL_TRIGGER_S ---
+                if forced_tl is None and elapsed >= TL_TRIGGER_S:
+                    tl_trigger_elapsed = elapsed
+                    # Prefer the TL currently governing the ego
+                    try:
+                        if self.ego.is_at_traffic_light():
+                            forced_tl = self.ego.get_traffic_light()
+                        else:
+                            ego_loc = self.ego.get_location()
+                            forced_tl = min(
+                                tl_actors,
+                                key=lambda tl: tl.get_location().distance(ego_loc),
+                            )
+                    except Exception:
+                        forced_tl = None
 
-                # Force ego brake when moving (speed-gated + fallback)
+                    if forced_tl:
+                        forced_tl.set_state(carla.TrafficLightState.Red)
+                        forced_tl.freeze(True)   # stays red indefinitely until we change it
+
+                # --- Step 2: force ego brake when moving ---
                 fire = (
                     not critical_triggered
                     and elapsed >= TL_TRIGGER_S
@@ -105,14 +116,16 @@ class H4RedLight(ScenarioBase):
                             rec.record(frame)
                             elapsed = frame["timestamp"] - start
 
-                # Unfreeze TL to green after hold so ego can continue
-                if forced_tl and elapsed >= TL_TRIGGER_S + RED_HOLD_S:
+                # --- Step 3: release TL after hold so ego can proceed ---
+                if (forced_tl is not None
+                        and tl_trigger_elapsed is not None
+                        and elapsed >= tl_trigger_elapsed + RED_HOLD_S):
                     try:
                         forced_tl.set_state(carla.TrafficLightState.Green)
                         forced_tl.freeze(True)
-                        forced_tl = None
                     except Exception:
-                        forced_tl = None
+                        pass
+                    forced_tl = None
 
         finally:
             if _owns_rec:
@@ -133,7 +146,7 @@ class H4RedLight(ScenarioBase):
                    if e["trigger_type"] == "BRAKING"]
         if not braking:
             raise ScenarioFailed(
-                f"{self.scenario_id}: expected BRAKING trigger. "
+                f"{self.scenario_id}: BRAKING trigger required. "
                 f"Got: {[e['trigger_type'] for e in self._action_events]}"
             )
 
