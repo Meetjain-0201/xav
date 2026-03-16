@@ -117,6 +117,7 @@ def run_scenario_stage(
     scenario_id: str,
     host: str,
     port: int,
+    skip_map_reload: bool = False,
 ) -> tuple[Path, dict]:
     """
     Instantiate, run, and record one scenario.
@@ -125,12 +126,11 @@ def run_scenario_stage(
     from scripts.data_collection.recorder import Recorder
     from scripts.autonomous.autopilot_controller import AutopilotController
 
-    # ScenarioClass is expected to accept scenario_id as a kwarg.
-    # It passes it through to ScenarioBase.__init__.
     scenario = ScenarioClass(
         scenario_id=scenario_id,
         host=host,
         port=port,
+        skip_map_reload=skip_map_reload,
     )
 
     t0 = time.monotonic()
@@ -207,6 +207,14 @@ def main() -> int:
         "--overlay-only", action="store_true",
         help="Only run overlay rendering on an already-generated scenario_id.",
     )
+    parser.add_argument(
+        "--no-map-reload", action="store_true",
+        help=(
+            "Skip client.load_world() and use whatever map CARLA already has loaded. "
+            "Use this when CARLA is already on the correct map to avoid the Signal 11 "
+            "segfault that occurs on some GPUs (e.g. RTX 5060) during map switches."
+        ),
+    )
     args = parser.parse_args()
 
     scenario_name = args.scenario
@@ -268,6 +276,45 @@ def main() -> int:
     ScenarioClass = _load_scenario_class(scenario_name)
     print(f"  Scenario class: {ScenarioClass.__name__}")
 
+    # Map mismatch check — warn before a potentially fatal load_world() call.
+    # Instantiating the class without connecting is safe: __init__ only stores
+    # map_name, no CARLA calls happen until setup().
+    _probe         = ScenarioClass(scenario_id="_probe")
+    required_map   = _probe.map_name
+    _c             = carla.Client(args.host, args.port)
+    _c.set_timeout(4.0)
+    current_map    = _c.get_world().get_map().name.split("/")[-1]  # e.g. "Town04"
+
+    if args.no_map_reload:
+        print(
+            f"  Map check     : --no-map-reload set — skipping load_world(). "
+            f"CARLA is on {current_map}, scenario wants {required_map}."
+        )
+    elif not current_map.endswith(required_map):
+        print(f"\n  {'!'*60}")
+        print(f"  WARNING: Map mismatch detected.")
+        print(f"    CARLA is currently on : {current_map}")
+        print(f"    This scenario needs   : {required_map}")
+        print(f"  Switching maps can cause a Signal 11 (segfault) crash on")
+        print(f"  some GPUs (RTX 5060 / Blackwell). Recommended options:")
+        print(f"")
+        print(f"    1. Restart CARLA on the correct map (safest):")
+        print(f"         cd ~/carla && ./CarlaUE4.sh -quality-level=Low")
+        print(f"       Then re-run this command.")
+        print(f"")
+        print(f"    2. If CARLA is already on {required_map}, skip the reload:")
+        print(f"         python scripts/run_scenario.py {scenario_name} --no-map-reload")
+        print(f"  {'!'*60}\n")
+        try:
+            ans = input("  Continue with map switch anyway? [y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            ans = "n"
+        if ans != "y":
+            print("  Aborted. Restart CARLA on the correct map and retry.")
+            return 1
+    else:
+        print(f"  Map check     : OK ({current_map} matches {required_map})")
+
     # ------------------------------------------------------------------
     # Stage 1 — Record
     # ------------------------------------------------------------------
@@ -276,7 +323,8 @@ def main() -> int:
     t_record = time.monotonic()
     try:
         output_dir, run_meta = run_scenario_stage(
-            ScenarioClass, scenario_id, args.host, args.port
+            ScenarioClass, scenario_id, args.host, args.port,
+            skip_map_reload=args.no_map_reload,
         )
     except Exception as e:
         print(f"\n  ERROR during recording: {e}")

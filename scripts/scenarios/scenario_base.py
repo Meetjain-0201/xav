@@ -68,6 +68,7 @@ class ScenarioBase(abc.ABC):
         fixed_delta_seconds: float = 0.05,
         data_root: str | None = None,
         scenario_id: str | None = None,
+        skip_map_reload: bool = False,
     ):
         """
         Args:
@@ -78,6 +79,10 @@ class ScenarioBase(abc.ABC):
             data_root:            Base path for output data.  Defaults to
                                   <repo_root>/data/scenarios/.
             scenario_id:          Folder name for this run, e.g. 'L1_highway_cruise_run1'.
+            skip_map_reload:      If True, never call client.load_world() — use whatever
+                                  map CARLA already has loaded.  Pass when CARLA is already
+                                  on the correct map to avoid the Signal 11 segfault that
+                                  occurs on some GPUs (e.g. RTX 5060) during map switches.
         """
         self.map_name = map_name
         self.spawn_index = spawn_index
@@ -85,6 +90,7 @@ class ScenarioBase(abc.ABC):
         self.port = port
         self.timeout = timeout
         self.fixed_delta_seconds = fixed_delta_seconds
+        self.skip_map_reload = skip_map_reload
 
         repo_root = Path(__file__).resolve().parents[2]
         self.data_root = Path(data_root) if data_root else repo_root / "data" / "scenarios"
@@ -130,7 +136,13 @@ class ScenarioBase(abc.ABC):
         logger.info("Connected — CARLA server version %s", server_version)
 
         current_map = self.client.get_world().get_map().name
-        if not current_map.endswith(self.map_name):
+        if self.skip_map_reload:
+            logger.info(
+                "Map reload skipped (skip_map_reload=True) — using current world (%s).",
+                current_map,
+            )
+            self.world = self.client.get_world()
+        elif not current_map.endswith(self.map_name):
             logger.info("Loading map %s (current: %s) …", self.map_name, current_map)
             self.world = self.client.load_world(self.map_name)
             # Give UE4 time to finish loading
