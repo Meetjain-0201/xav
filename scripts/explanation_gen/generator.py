@@ -63,51 +63,86 @@ Style: 'I'm slowing down to give the pedestrian ahead safe space to cross.'"""
 # Template rules (no API — trigger_type → human-readable string)
 # ---------------------------------------------------------------------------
 
-def _template_explanation(trigger_type: str, snap: dict) -> str:
+def _template_explanation(
+    trigger_type: str,
+    snap: dict,
+    yolo_nearby: list[str] | None = None,
+) -> str:
     """
-    Rule-based explanation derived purely from telemetry.
-    No API call, always available.
-    """
-    speed   = round(snap.get("speed_kmh", 0), 1)
-    brake   = round(snap.get("brake", 0), 2)
-    throttle= round(snap.get("throttle", 0), 2)
-    steer   = round(snap.get("steer", 0), 2)
-    gear    = snap.get("gear", 1)
+    Terse, mechanical rule-based explanation — mirrors early BDD-X style.
+    Maximum ~6 words: action verb + primary cause only.
 
-    rules = {
-        "BRAKING": (
-            f"The vehicle is braking (brake={brake}) from {speed} km/h. "
-            "Decelerating due to an obstacle or traffic condition ahead."
-        ),
-        "ACCELERATING": (
-            f"The vehicle is accelerating (throttle={throttle}) to {speed} km/h in gear {gear}. "
-            "Increasing speed to match traffic flow."
-        ),
-        "LANE_CHANGE": (
-            f"The vehicle is changing lanes (steer={steer:+.2f}) at {speed} km/h. "
-            "Adjusting lateral position on the road."
-        ),
-        "TURNING": (
-            f"The vehicle is turning (steer={steer:+.2f}) at {speed} km/h. "
-            "Following the road curvature."
-        ),
-        "SPEED_CHANGE": (
-            f"The vehicle speed changed significantly to {speed} km/h "
-            f"(throttle={throttle}, brake={brake})."
-        ),
-        "PEDESTRIAN_CLOSE": (
-            f"A pedestrian is detected close to the vehicle. "
-            f"Current speed {speed} km/h, brake={brake}."
-        ),
-        "COLLISION_RISK": (
-            f"Collision risk detected. Emergency response active at {speed} km/h "
-            f"(brake={brake})."
-        ),
-    }
-    return rules.get(
-        trigger_type,
-        f"Vehicle action detected: {trigger_type} at {speed} km/h.",
-    )
+    Priority for each trigger type is context-first: what CARLA/YOLO actually
+    observed takes precedence over generic fallbacks.
+
+    Args:
+        trigger_type: Trigger type string from action_events.json.
+        snap:         Telemetry snapshot including traffic_light_state.
+        yolo_nearby:  YOLO class names detected within ±0.5 s of the trigger.
+    """
+    nearby    = set(yolo_nearby or [])
+    steer     = snap.get("steer", 0.0)
+    tl_state  = snap.get("traffic_light_state", "none")   # "red"|"yellow"|"green"|"none"
+    speed_kmh = snap.get("speed_kmh", 0.0)
+
+    has_pedestrian    = "person"        in nearby
+    has_cyclist       = "bicycle"       in nearby
+    # YOLO traffic light detection — used as fallback when traffic_light_state
+    # is absent (recordings made before scenario_base added the field).
+    # If the vehicle is braking and YOLO sees a traffic light, it is red.
+    has_yolo_tl       = "traffic light" in nearby
+
+    # ------------------------------------------------------------------
+    # BRAKING — ordered by specificity of observed cause.
+    # CARLA telemetry state takes priority; YOLO is the fallback.
+    # Traffic light beats pedestrian because a red light is the primary
+    # legal cause of the stop even when pedestrians are also in frame.
+    # ------------------------------------------------------------------
+    if trigger_type == "BRAKING":
+        if tl_state == "red":
+            return "Braking. Red light."
+        if tl_state == "yellow":
+            return "Braking. Yellow light."
+        if has_yolo_tl:                   # fallback: CARLA state not in telemetry
+            return "Braking. Red light."
+        if has_pedestrian:
+            return "Braking. Pedestrian ahead."
+        if has_cyclist:
+            return "Braking. Cyclist ahead."
+        return "Braking. Obstacle ahead."
+
+    # ------------------------------------------------------------------
+    # ACCELERATING
+    # ------------------------------------------------------------------
+    if trigger_type == "ACCELERATING":
+        if tl_state == "green":
+            return "Accelerating. Green light."
+        if has_yolo_tl:                   # vehicle departed from a traffic light
+            return "Accelerating. Green light."
+        # If speed is low at trigger time, vehicle was recently stopped
+        if speed_kmh < 15:
+            return "Resuming. Road is clear."
+        return "Accelerating."
+
+    # ------------------------------------------------------------------
+    # LANE_CHANGE / TURNING — direction from steer sign
+    # ------------------------------------------------------------------
+    if trigger_type in ("LANE_CHANGE", "TURNING"):
+        return "Turning right." if steer > 0 else "Turning left."
+
+    # ------------------------------------------------------------------
+    # Remaining triggers
+    # ------------------------------------------------------------------
+    if trigger_type == "SPEED_CHANGE":
+        return "Adjusting speed."
+
+    if trigger_type == "PEDESTRIAN_CLOSE":
+        return "Pedestrian detected."
+
+    if trigger_type == "COLLISION_RISK":
+        return "Hazard detected."
+
+    return trigger_type.replace("_", " ").capitalize() + "."
 
 
 # ---------------------------------------------------------------------------
@@ -333,8 +368,21 @@ def generate_all_explanations(scenario_dir: str | Path) -> dict[str, Path]:
     # ------------------------------------------------------------------
     # Condition 2 — Template (always succeeds)
     # ------------------------------------------------------------------
+    def _nearby_classes(ts: float) -> list[str]:
+        return [
+            d["class_name"] for d in yolo_detections
+            if abs(d.get("timestamp", 0) - ts) <= 0.5
+        ]
+
     template_entries = [
-        _make_entry(ev, _template_explanation(ev["trigger_type"], ev["telemetry_snapshot"]))
+        _make_entry(
+            ev,
+            _template_explanation(
+                ev["trigger_type"],
+                ev["telemetry_snapshot"],
+                _nearby_classes(ev["timestamp"]),
+            ),
+        )
         for ev in events
     ]
 
