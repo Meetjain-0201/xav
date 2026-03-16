@@ -425,9 +425,18 @@ class ScenarioBase(abc.ABC):
             logger.info("Synchronous mode OFF.")
 
     @abc.abstractmethod
-    def run(self) -> dict:
+    def run(self, ap=None, rec=None) -> dict:
         """
         Implement scenario logic here.
+
+        When called by run_scenario.py, `ap` and `rec` are already constructed
+        and started.  Scenarios only need to:
+          - Set weather / NPCs
+          - Drive the tick loop:  frame = self.tick(); rec.record(frame)
+          - Return metadata
+
+        When called standalone (e.g. in tests), ap and rec may be None and
+        the scenario is responsible for constructing them if needed.
 
         Returns:
             Metadata dict, e.g.:
@@ -462,7 +471,7 @@ class ScenarioBase(abc.ABC):
 class _SmokeTestScenario(ScenarioBase):
     """Minimal scenario: spawn ego, run 5 s, clean up."""
 
-    def run(self) -> dict:
+    def run(self, ap=None, rec=None) -> dict:
         logger.info("Smoke test: running for 5 simulated seconds …")
         start = self.world.get_snapshot().timestamp.elapsed_seconds
         frames = 0
