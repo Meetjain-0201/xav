@@ -278,6 +278,17 @@ class ScenarioBase(abc.ABC):
             frame["latitude"]  = round(self._latest_gnss.latitude, 6)
             frame["longitude"] = round(self._latest_gnss.longitude, 6)
 
+        # Traffic light state — "red" | "yellow" | "green" | "off" | "none"
+        # "none" means the ego is not currently governed by a traffic light.
+        try:
+            if self.ego.is_at_traffic_light():
+                tl_state = str(self.ego.get_traffic_light().get_state())
+                frame["traffic_light_state"] = tl_state.split(".")[-1].lower()
+            else:
+                frame["traffic_light_state"] = "none"
+        except Exception:
+            frame["traffic_light_state"] = "none"
+
         self._telemetry.append(frame)
 
         # Keep a short speed history for delta-speed triggers
