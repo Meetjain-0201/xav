@@ -1,17 +1,18 @@
 """
-h1_pedestrian_dash.py — Pedestrian dashes into road; ego emergency-brakes.
+h1_pedestrian_dash.py
+Critical event: pedestrian runs into road at tick ~200 (t≈10s); ego hard-brakes for 2s.
 
 Criticality: HIGH
 Map: Town01
 Duration: 20 s
 
-Determinism guarantee:
-1. All TLs frozen GREEN — ego drives at speed without stopping at junctions
-2. BasicAgent drives at 35 km/h; speed is confirmed > MIN_SPEED_KMH before triggering
-3. Walker spawned on sidewalk 20 m ahead via waypoint + perpendicular offset
-4. At trigger: walker.apply_control(WalkerControl) sends walker into road
-5. ap.override() forces ego brake=1.0 for ~1.5 s simultaneously
-6. With 35 km/h → brake=1.0 for 30 ticks the speed drops >> 5 km/h → BRAKING fires
+Implementation notes:
+- Walker spawn location computed from ego's ACTUAL spawn transform using
+  forward/right vectors (NOT from nav-mesh or waypoints — those only reach sidewalks).
+- WalkerControl applied EVERY tick after trigger so physics keeps the walker moving.
+  A single apply_control() fires once; in sync mode you must re-apply each step.
+- All TLs frozen GREEN so ego reaches MIN_SPEED_KMH before trigger fires.
+- ap.override() suspends BasicAgent for 40 ticks of brake=1.0.
 """
 import sys
 from pathlib import Path
@@ -24,13 +25,13 @@ from scripts.data_collection.recorder import Recorder
 
 DURATION      = 20.0
 TARGET_KMH    = 35.0
-MIN_SPEED_KMH = 12.0
+MIN_SPEED_KMH = 15.0   # ego must be moving before event fires
 WARMUP_S      =  5.0
-FALLBACK_S    = 12.0
+FALLBACK_S    = 12.0   # fire regardless of speed if this elapses
 
 
 def _dest(world, ego, dist_m=600.0):
-    wp = world.get_map().get_waypoint(ego.get_location())
+    wp  = world.get_map().get_waypoint(ego.get_location())
     wps = wp.next(dist_m)
     return wps[0].transform.location if wps \
         else world.get_map().get_spawn_points()[-1].location
@@ -43,30 +44,36 @@ class H1PedestrianDash(ScenarioBase):
     def run(self, ap=None, rec=None) -> dict:
         self.world.set_weather(carla.WeatherParameters.WetCloudyNoon)
 
-        # Freeze all TLs green — ego must be moving when event fires
+        # Freeze all TLs green so ego reaches speed before the event
         for tl in self.world.get_actors().filter("traffic.traffic_light"):
             tl.set_state(carla.TrafficLightState.Green)
             tl.freeze(True)
 
-        # --- Spawn walker on sidewalk 20 m ahead, 4 m to the right ---
+        # --- Walker spawn location from ego's actual spawn transform ---
+        # 20 m ahead, 3 m to the right of ego's lane → standing on sidewalk
+        spawn_points = self.world.get_map().get_spawn_points()
+        ego_t   = spawn_points[self.spawn_index]
+        fwd     = ego_t.get_forward_vector()
+        right   = ego_t.get_right_vector()
+        walker_loc = carla.Location(
+            x = ego_t.location.x + 20.0 * fwd.x - 3.0 * right.x,
+            y = ego_t.location.y + 20.0 * fwd.y - 3.0 * right.y,
+            z = ego_t.location.z + 0.5,
+        )
+        # Walk direction: perpendicular to road, INTO traffic (negate right vector)
+        walk_dir = carla.Vector3D(x=-right.x, y=-right.y, z=0.0)
+
         bp_lib    = self.world.get_blueprint_library()
         ped_bps   = list(bp_lib.filter("walker.pedestrian.*"))
         walker_bp = ped_bps[0] if ped_bps else None
-
-        walker   = None
-        walk_dir = carla.Vector3D(x=-1.0, y=0.0, z=0.0)
-
-        ego_wp    = self.world.get_map().get_waypoint(self.ego.get_location())
-        ahead_wps = ego_wp.next(20.0)
-        if walker_bp and ahead_wps:
-            fwd   = ahead_wps[0].transform.get_forward_vector()
-            right = carla.Vector3D(x=-fwd.y, y=fwd.x, z=0.0)
-            loc   = (
-                ahead_wps[0].transform.location
-                + carla.Location(x=right.x * 4.0, y=right.y * 4.0, z=0.5)
+        walker    = None
+        if walker_bp:
+            walker = self.world.try_spawn_actor(
+                walker_bp,
+                carla.Transform(walker_loc, carla.Rotation(yaw=ego_t.rotation.yaw + 90)),
             )
-            walker   = self.world.try_spawn_actor(walker_bp, carla.Transform(loc))
-            walk_dir = carla.Vector3D(x=-right.x, y=-right.y, z=0.0)  # into road
+            if walker:
+                self.world.tick()   # let physics settle before controlling
 
         if ap is None:
             ap = AgentController(self.ego, self.world,
@@ -85,12 +92,14 @@ class H1PedestrianDash(ScenarioBase):
         try:
             start = self.world.get_snapshot().timestamp.elapsed_seconds
             elapsed = 0.0
+
             while elapsed < DURATION:
                 frame   = self.tick()
                 ap.update(frame)
                 rec.record(frame)
                 elapsed = frame["timestamp"] - start
 
+                # Fire when ego is moving (speed gate) or at fallback time
                 fire = (
                     not critical_triggered
                     and elapsed >= WARMUP_S
@@ -99,28 +108,40 @@ class H1PedestrianDash(ScenarioBase):
 
                 if fire:
                     critical_triggered = True
-                    # Step 1: pedestrian dashes into road
-                    if walker and walker.is_alive:
-                        walker.apply_control(carla.WalkerControl(
-                            speed=4.0,
-                            direction=walk_dir,
-                        ))
-                    # Step 2: ego emergency-brakes (~1.5 s = 30 ticks at 20 Hz)
+
+                    # Ego emergency-brakes for 40 ticks ≈ 2 s @ 20 Hz
+                    # Walker control applied EVERY tick inside the override loop
                     with ap.override():
-                        for _ in range(30):
+                        for _ in range(40):
                             self.ego.apply_control(
                                 carla.VehicleControl(brake=1.0, throttle=0.0)
                             )
+                            # Re-apply WalkerControl each tick (sync mode requires it)
+                            if walker and walker.is_alive:
+                                walker.apply_control(carla.WalkerControl(
+                                    direction=walk_dir,
+                                    speed=4.0,
+                                    jump=False,
+                                ))
                             frame   = self.tick()
                             ap.update(frame)
                             rec.record(frame)
                             elapsed = frame["timestamp"] - start
 
+                # Keep walker moving after override ends
+                elif critical_triggered and walker and walker.is_alive:
+                    walker.apply_control(carla.WalkerControl(
+                        direction=walk_dir,
+                        speed=4.0,
+                        jump=False,
+                    ))
+
         finally:
             if _owns_rec:
                 rec.__exit__(None, None, None)
 
-        if walker and walker.is_alive: walker.destroy()
+        if walker and walker.is_alive:
+            walker.destroy()
         ap.disable()
 
         return {
@@ -136,7 +157,7 @@ class H1PedestrianDash(ScenarioBase):
                    if e["trigger_type"] == "BRAKING"]
         if not braking:
             raise ScenarioFailed(
-                f"{self.scenario_id}: expected BRAKING trigger. "
+                f"{self.scenario_id}: BRAKING trigger required. "
                 f"Got: {[e['trigger_type'] for e in self._action_events]}"
             )
 

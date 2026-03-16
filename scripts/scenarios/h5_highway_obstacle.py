@@ -1,17 +1,18 @@
 """
-h5_highway_obstacle.py — Stationary NPC becomes highway obstacle; ego emergency-brakes.
+h5_highway_obstacle.py
+Critical event: stationary obstacle car 35 m ahead detected at ~20 m; ego brakes 2s.
 
 Criticality: HIGH
 Map: Town04
 Duration: 25 s
 
-Determinism guarantee:
-1. All TLs frozen GREEN — ego drives at highway speed (80 km/h) unimpeded
-2. NPC spawned 30 m ahead via waypoints (same lane/road as ego)
-3. Phase 1 (t=5s): NPC stops hard (brake=1.0, hand_brake=True)
-4. Phase 2 (t=8s or when ego > MIN_SPEED_KMH): ap.override() forces ego brake=0.9
-   The 3 s gap gives NPC time to slow/stop before ego brakes
-5. Speed gate ensures ego is at 50+ km/h when brake fires → large speed drop → BRAKING
+Implementation notes:
+- Obstacle NPC spawned 35 m ahead, IMMEDIATELY stopped + set_simulate_physics(False)
+  so it stays perfectly in place regardless of anything else happening
+- Trigger is DISTANCE-BASED (ego within 20 m) rather than time-based for reliability
+- BasicAgent detects stationary vehicle via its vehicle-obstacle logic and begins
+  slowing; we simultaneously force brake=1.0 via ap.override() to guarantee BRAKING
+- All TLs frozen GREEN so ego reaches 50+ km/h before the trigger fires
 """
 import sys
 from pathlib import Path
@@ -22,17 +23,16 @@ from scripts.scenarios.scenario_base import ScenarioBase, ScenarioFailed
 from scripts.autonomous.agent_controller import AgentController
 from scripts.data_collection.recorder import Recorder
 
-DURATION       = 25.0
-TARGET_KMH     = 80.0
-MIN_SPEED_KMH  = 50.0
-WARMUP_S       =  5.0
-NPC_STOP_S     =  5.0   # when NPC stops
-BRAKE_DELAY_S  =  3.0   # gap between NPC stop and forced ego brake
-FALLBACK_S     = 16.0
+DURATION        = 25.0
+TARGET_KMH      = 80.0
+MIN_SPEED_KMH   = 50.0
+TRIGGER_DIST_M  = 20.0   # ego-to-obstacle distance that fires emergency brake
+WARMUP_S        =  5.0
+FALLBACK_S      = 16.0   # time-based fallback if distance trigger never fires
 
 
 def _dest(world, ego, dist_m=700.0):
-    wp = world.get_map().get_waypoint(ego.get_location())
+    wp  = world.get_map().get_waypoint(ego.get_location())
     wps = wp.next(dist_m)
     return wps[0].transform.location if wps \
         else world.get_map().get_spawn_points()[-1].location
@@ -54,17 +54,21 @@ class H5HighwayObstacle(ScenarioBase):
                    if b.get_attribute("number_of_wheels").as_int() == 4]
         npc_bp  = car_bps[0] if car_bps else bp_lib.filter("vehicle.*")[0]
 
-        # Spawn NPC 30 m ahead in the same lane
+        # Spawn obstacle 35 m ahead in same lane — STATIONARY from t=0
         ego_wp    = self.world.get_map().get_waypoint(self.ego.get_location())
-        ahead_wps = ego_wp.next(30.0)
-        npc = None
+        ahead_wps = ego_wp.next(35.0)
+        obstacle  = None
         if ahead_wps:
-            t = ahead_wps[0].transform; t.location.z += 0.5
-            npc = self.world.try_spawn_actor(npc_bp, t)
-        if npc:
-            npc.set_autopilot(True, self.traffic_manager.get_port())
-            self.traffic_manager.ignore_lights_percentage(npc, 100)
-            self.traffic_manager.vehicle_percentage_speed_difference(npc, 0)
+            t = ahead_wps[0].transform
+            t.location.z += 0.5
+            obstacle = self.world.try_spawn_actor(npc_bp, t)
+
+        if obstacle:
+            # Brake hard + disable physics so it becomes a true static obstacle
+            obstacle.apply_control(
+                carla.VehicleControl(brake=1.0, hand_brake=True, throttle=0.0)
+            )
+            obstacle.set_simulate_physics(False)   # stays exactly in place
 
         if ap is None:
             ap = AgentController(self.ego, self.world,
@@ -78,43 +82,41 @@ class H5HighwayObstacle(ScenarioBase):
         else:
             _owns_rec = False
 
-        npc_stopped        = False
-        npc_stop_time      = None
         critical_triggered = False
 
         try:
             start = self.world.get_snapshot().timestamp.elapsed_seconds
             elapsed = 0.0
+
             while elapsed < DURATION:
                 frame   = self.tick()
                 ap.update(frame)
                 rec.record(frame)
                 elapsed = frame["timestamp"] - start
 
-                # Phase 1: stop NPC after warmup
-                if (not npc_stopped
-                        and elapsed >= NPC_STOP_S
-                        and npc and npc.is_alive):
-                    npc_stopped   = True
-                    npc_stop_time = elapsed
-                    npc.set_autopilot(False)
-                    npc.apply_control(
-                        carla.VehicleControl(brake=1.0, hand_brake=True, throttle=0.0)
-                    )
+                if elapsed < WARMUP_S:
+                    continue
 
-                # Phase 2: force ego brake 3 s after NPC stopped
+                # Distance-based trigger: fire when ego is within TRIGGER_DIST_M
+                if obstacle and obstacle.is_alive:
+                    dist = self.ego.get_location().distance(obstacle.get_location())
+                else:
+                    dist = 0.0   # obstacle gone → use fallback
+
                 fire = (
                     not critical_triggered
-                    and npc_stop_time is not None
-                    and elapsed >= npc_stop_time + BRAKE_DELAY_S
-                    and (frame["speed_kmh"] > MIN_SPEED_KMH or elapsed >= FALLBACK_S)
+                    and (
+                        (frame["speed_kmh"] > MIN_SPEED_KMH and dist < TRIGGER_DIST_M)
+                        or elapsed >= FALLBACK_S
+                    )
                 )
+
                 if fire:
                     critical_triggered = True
                     with ap.override():
                         for _ in range(40):   # 2 s
                             self.ego.apply_control(
-                                carla.VehicleControl(brake=0.9, throttle=0.0)
+                                carla.VehicleControl(brake=1.0, throttle=0.0)
                             )
                             frame   = self.tick()
                             ap.update(frame)
@@ -125,7 +127,9 @@ class H5HighwayObstacle(ScenarioBase):
             if _owns_rec:
                 rec.__exit__(None, None, None)
 
-        if npc and npc.is_alive: npc.destroy()
+        if obstacle and obstacle.is_alive:
+            obstacle.set_simulate_physics(True)
+            obstacle.destroy()
         ap.disable()
 
         return {
@@ -133,7 +137,7 @@ class H5HighwayObstacle(ScenarioBase):
             "criticality": "high",
             "map": "Town04",
             "duration_s": DURATION,
-            "npc_count": 1 if npc else 0,
+            "npc_count": 1 if obstacle else 0,
         }
 
     def verify(self) -> None:
@@ -141,7 +145,7 @@ class H5HighwayObstacle(ScenarioBase):
                    if e["trigger_type"] == "BRAKING"]
         if not braking:
             raise ScenarioFailed(
-                f"{self.scenario_id}: expected BRAKING trigger. "
+                f"{self.scenario_id}: BRAKING trigger required. "
                 f"Got: {[e['trigger_type'] for e in self._action_events]}"
             )
 
