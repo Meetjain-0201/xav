@@ -1585,6 +1585,278 @@ class S2_SuddenStopEvasion(AdaptTrustScenario):
 
         return seq
 
+
+# ---------------------------------------------------------------------------
+# S4 — Emergency Vehicle Pull-Over
+# ---------------------------------------------------------------------------
+
+class S4_EmergencyVehiclePullOver(AdaptTrustScenario):
+    """
+    Town02 — Corner-first design.
+
+    Layout:
+      Ego       : spawn[0] (x≈-7.5, y≈142), heading north.
+      Ambulance : spawns ~30 m behind ego (max available road south of spawn[0]).
+
+    Phases:
+      Phase 0 (8 s): Ego drives north at 25 km/h through the Town02 junction
+              at y≈191 and turns onto the second northbound straight (x≈41).
+              Ambulance holds stationary (brake=1.0).  Gives ego a ~56 m head
+              start — it has cleared the corner before the ambulance launches.
+
+      Phase 1 (≤12 s trigger): Ambulance handed to TrafficManager at 2× speed
+              limit (~60 km/h) with ignore_vehicles=100% so it drives through
+              junctions without stopping.  Follows the same road path as ego.
+              Trigger fires when gap ≤ 35 m (both on second straight by then).
+
+      Phase 2 (≤7 s): Ego steers right (east = +x on northbound road) for 20
+              ticks to gain curb clearance, then hard-brakes.  Ambulance
+              continues under TM and passes on the left.
+
+      Phase 3 (≤8 s): Ego resumes with BasicAgent. TOut ends scenario.
+
+    Unexplainability: front camera shows clear road — the approaching
+      ambulance is only visible in the rear-view mirror.
+
+    Trigger: BRAKING
+    """
+
+    duration     = 35.0
+    target_speed = 25.0
+
+    def _do_initialize_actors(self, world):
+        bp_lib    = world.get_blueprint_library()
+        emerg_bps = [b for b in bp_lib.filter("vehicle.*") if "ambulance" in b.id]
+        car_bps   = [b for b in bp_lib.filter("vehicle.*")
+                     if b.get_attribute("number_of_wheels").as_int() == 4]
+        bp = emerg_bps[0] if emerg_bps else (car_bps[0] if car_bps
+                                              else bp_lib.filter("vehicle.*")[0])
+
+        # Town02 spawn[0] southbound road only extends ~31 m before the
+        # map boundary.  Probe backwards in decreasing steps to find a valid
+        # spawn waypoint.
+        ego_wp     = world.get_map().get_waypoint(self._ego().get_location())
+        behind_wps = None
+        for dist in [30.0, 25.0, 20.0, 15.0]:
+            behind_wps = ego_wp.previous(dist)
+            if behind_wps:
+                break
+
+        if not behind_wps:
+            self._emerg_npc = None
+            print("[S4] WARNING: no waypoint behind ego — skipping NPC")
+            return
+
+        t = carla.Transform(
+            behind_wps[0].transform.location + carla.Location(z=0.5),
+            behind_wps[0].transform.rotation)
+        npc = world.try_spawn_actor(bp, t)
+        if not npc:
+            self._emerg_npc = None
+            print("[S4] WARNING: ambulance spawn failed")
+            return
+
+        self._emerg_npc = npc
+        self.other_actors.append(npc)
+        CarlaDataProvider.register_actor(npc, t)
+        CarlaDataProvider._carla_actor_pool[npc.id] = npc
+        world.tick()
+        CarlaDataProvider.on_carla_tick()
+        loc = npc.get_transform().location
+        print(f"[S4] Ambulance ({bp.id}) id={npc.id}  x={loc.x:.1f} y={loc.y:.1f}")
+
+    def _do_create_behavior(self):
+        from srunner.scenariomanager.timer import TimeOut as TOut
+
+        ego = self._ego()
+        npc = getattr(self, "_emerg_npc", None)
+
+        # dest_far: 120 m along road from spawn[0]
+        # = 49 m north + 33 m east + 38 m north ≈ (x≈41, y≈229).
+        # Well on the second northbound straight; all three phases share it.
+        dest = self._dest(500.0)
+
+        # ----------------------------------------------------------------
+        # PullToCurb: two-phase right-curb manoeuvre
+        #   Phase A (steer_ticks=20, 1 s): steer=-0.60, brake=0.10
+        #     → drifts east (+x) while still moving forward
+        #   Phase B (brake_ticks=60, 3 s): steer held, hard brake
+        #     → stops on the right curb
+        # ----------------------------------------------------------------
+        class PullToCurb(AtomicBehavior):
+            def __init__(inner, actor, steer=-0.60, steer_ticks=20,
+                         brake=0.70, brake_ticks=60, name="PullToCurb"):
+                super().__init__(name, actor)
+                inner._steer       = steer
+                inner._steer_ticks = steer_ticks
+                inner._brake       = brake
+                inner._brake_ticks = brake_ticks
+                inner._count       = 0
+
+            def initialise(inner):
+                inner._count = 0
+
+            def update(inner):
+                if inner._count < inner._steer_ticks:
+                    # No brake during steer phase — friction kills lateral drift
+                    inner._actor.apply_control(carla.VehicleControl(
+                        throttle=0.0, brake=0.0, steer=inner._steer))
+                else:
+                    inner._actor.apply_control(carla.VehicleControl(
+                        throttle=0.0, brake=inner._brake, steer=inner._steer))
+                inner._count += 1
+                total = inner._steer_ticks + inner._brake_ticks
+                return (py_trees.common.Status.SUCCESS
+                        if inner._count >= total
+                        else py_trees.common.Status.RUNNING)
+
+        # ----------------------------------------------------------------
+        # StaticHold: keep ambulance stationary during Phase 0
+        # ----------------------------------------------------------------
+        class StaticHold(AtomicBehavior):
+            def __init__(inner, actor, name="StaticHold"):
+                super().__init__(name, actor)
+
+            def update(inner):
+                inner._actor.apply_control(carla.VehicleControl(
+                    throttle=0.0, brake=1.0))
+                return py_trees.common.Status.RUNNING  # never self-succeeds
+
+        seq = py_trees.composites.Sequence("S4_EmergencyPullOver")
+
+        # ---- Phase 0: ego clears y≈191 junction (10 s), ambulance holds ----
+        # At 25 km/h, ego covers 69 m in 10 s → y≈211, safely past the
+        # first junction.  Ambulance holds brake at y≈111.
+        phase0 = py_trees.composites.Parallel(
+            "S4_Phase0_Corner",
+            policy=py_trees.common.ParallelPolicy.SUCCESS_ON_ONE)
+        phase0.add_child(EgoBasicAgentBehavior(ego, dest, self.target_speed,
+                                               ignore_tl=True,
+                                               name="S4_CornerDrive"))
+        if npc:
+            phase0.add_child(StaticHold(npc, name="S4_AmbulanceWait"))
+        phase0.add_child(TOut(10.0, name="S4_Phase0Timeout"))
+        seq.add_child(phase0)
+
+        # ---- Phase 1: ambulance chases ego using BasicAgent (same routing as ego) ----
+        # BasicAgent uses GlobalRoutePlanner → correctly navigates the y≈191
+        # junction turn east, same path as ego.  ignore_vehicles=True so it
+        # doesn't slow for ego.  Trigger at 40 m gap; TOut(20s) fallback.
+        phase1 = py_trees.composites.Parallel(
+            "S4_Phase1_Chase",
+            policy=py_trees.common.ParallelPolicy.SUCCESS_ON_ONE)
+        phase1.add_child(EgoBasicAgentBehavior(ego, dest, self.target_speed,
+                                               ignore_tl=True, name="S4_EgoCruise"))
+        if npc:
+            phase1.add_child(EgoBasicAgentBehavior(npc, dest, 60.0,
+                                                   ignore_tl=True,
+                                                   ignore_vehicles=True,
+                                                   name="S4_AmbulanceChase"))
+            phase1.add_child(InTriggerDistanceToVehicle(
+                npc, ego, 40.0, name="S4_AmbulanceClose"))
+        phase1.add_child(TOut(20.0, name="S4_Phase1Timeout"))
+        seq.add_child(phase1)
+
+        # ----------------------------------------------------------------
+        # SnapToRoad: teleport ego back onto nearest road waypoint and
+        # zero velocity so BasicAgent can navigate from a clean state.
+        # ----------------------------------------------------------------
+        class SnapToRoad(AtomicBehavior):
+            def __init__(inner, actor, world, name="SnapToRoad"):
+                super().__init__(name, actor)
+                inner._world = world
+
+            def update(inner):
+                wp = inner._world.get_map().get_waypoint(inner._actor.get_location())
+                inner._actor.set_transform(carla.Transform(
+                    carla.Location(x=wp.transform.location.x,
+                                   y=wp.transform.location.y,
+                                   z=wp.transform.location.z + 0.5),
+                    wp.transform.rotation))
+                inner._actor.set_target_velocity(carla.Vector3D(0, 0, 0))
+                inner._actor.apply_control(carla.VehicleControl(
+                    throttle=0.0, brake=0.0, steer=0.0))
+                return py_trees.common.Status.SUCCESS
+
+        # ----------------------------------------------------------------
+        # HoldBrake: keep ego fully braked — RUNNING forever.
+        # Used after PullToCurb so ego stays at curb while ambulance passes.
+        # ----------------------------------------------------------------
+        class HoldBrake(AtomicBehavior):
+            def __init__(inner, actor, name="HoldBrake"):
+                super().__init__(name, actor)
+
+            def update(inner):
+                inner._actor.apply_control(carla.VehicleControl(
+                    throttle=0.0, brake=1.0, steer=0.0))
+                return py_trees.common.Status.RUNNING
+
+        # ----------------------------------------------------------------
+        # WaitUntilAhead: succeeds once `chaser` is `margin` m past `anchor`
+        # along the y axis (north direction on this road).
+        # ----------------------------------------------------------------
+        class WaitUntilAhead(AtomicBehavior):
+            def __init__(inner, chaser, anchor, margin=20.0, name="WaitUntilAhead"):
+                super().__init__(name, chaser)
+                inner._anchor = anchor
+                inner._margin = margin
+
+            def update(inner):
+                cy = inner._actor.get_location().y
+                ay = inner._anchor.get_location().y
+                return (py_trees.common.Status.SUCCESS
+                        if cy > ay + inner._margin
+                        else py_trees.common.Status.RUNNING)
+
+        # ---- Phase 2: ego pulls LEFT, holds at curb until ambulance clears ----
+        # Structure: Parallel(SUCCESS_ON_ONE)
+        #   - Sequence: PullToCurb → HoldBrake  (ego stays stopped after PullToCurb)
+        #   - BasicAgent(ambulance, ignore_vehicles=True)  ← drives past stopped ego
+        #   - WaitUntilAhead(ambulance, ego, margin=20)  ← ends phase when clear
+        #   - TOut(12s) fallback
+        # WaitUntilAhead fires AFTER ambulance is 20 m north of stopped ego,
+        # so SnapToRoad teleport can't block the ambulance.
+        curb_hold = py_trees.composites.Sequence("S4_CurbHold")
+        curb_hold.add_child(PullToCurb(ego, steer=+0.60, steer_ticks=20,
+                                       brake=0.80, brake_ticks=60,
+                                       name="S4_PullToCurb"))
+        curb_hold.add_child(HoldBrake(ego, name="S4_HoldBrake"))
+
+        phase2 = py_trees.composites.Parallel(
+            "S4_Phase2_PullOver",
+            policy=py_trees.common.ParallelPolicy.SUCCESS_ON_ONE)
+        phase2.add_child(curb_hold)
+        if npc:
+            phase2.add_child(EgoBasicAgentBehavior(npc, dest, 60.0,
+                                                   ignore_tl=True,
+                                                   ignore_vehicles=True,
+                                                   name="S4_AmbulancePass"))
+            phase2.add_child(WaitUntilAhead(npc, ego, margin=20.0,
+                                            name="S4_AmbulanceClear"))
+        phase2.add_child(TOut(12.0, name="S4_Phase2Timeout"))
+        seq.add_child(phase2)
+
+        # ---- Phase 3: snap ego back to road, then resume ----
+        # SnapToRoad fires only after ambulance is 20 m clear, so it cannot
+        # block the ambulance path. Ego is snapped to road orientation so
+        # BasicAgent drives north correctly.
+        phase3_seq = py_trees.composites.Sequence("S4_Phase3_Seq")
+        phase3_seq.add_child(SnapToRoad(ego, self.world, name="S4_SnapToRoad"))
+        phase3 = py_trees.composites.Parallel(
+            "S4_Phase3_Resume",
+            policy=py_trees.common.ParallelPolicy.SUCCESS_ON_ONE)
+        phase3.add_child(EgoBasicAgentBehavior(ego, dest, self.target_speed,
+                                               ignore_tl=True,
+                                               ignore_vehicles=True,
+                                               name="S4_Resume"))
+        phase3.add_child(TOut(8.0, name="S4_Phase3Timeout"))
+        phase3_seq.add_child(phase3)
+        seq.add_child(phase3_seq)
+
+        return seq
+
+
+
 # ---------------------------------------------------------------------------
 # Registry — maps scenario_id string → class
 # ---------------------------------------------------------------------------
@@ -1601,6 +1873,8 @@ SCENARIO_REGISTRY = {
     "H3_RedLightRunner":    H3_RedLightRunner,
     "S1_JaywalkingAdult":          S1_JaywalkingAdult,
     "S2_SuddenStopEvasion":        S2_SuddenStopEvasion,
+    "S4_EmergencyVehiclePullOver": S4_EmergencyVehiclePullOver,
+
 }
 
 # Map: scenario_id → (map_name, spawn_index)
@@ -1616,4 +1890,6 @@ SCENARIO_MAP = {
     "H3_RedLightRunner":    ("Town03", 1),
     "S1_JaywalkingAdult":          ("Town02", 0),
     "S2_SuddenStopEvasion":        ("Town04", 10),
+    "S4_EmergencyVehiclePullOver": ("Town02", 0),
+
 }
