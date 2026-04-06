@@ -17,12 +17,16 @@ Usage (from adaptrust_runner.py):
     CarlaDataProvider.on_carla_tick()
     scenario.scenario_tree.tick_once()
 
-sys.path must include /home/meet/scenario_runner before importing this module.
+sys.path must include ~/carla/PythonAPI/carla before importing this module.
 """
 
 import sys
-sys.path.insert(0, "/home/meet/scenario_runner")
-sys.path.insert(0, "/home/meet/carla/PythonAPI/carla")
+import math
+from pathlib import Path
+_HOME = Path.home()
+sys.path.insert(0, str(_HOME / "scenario_runner"))
+sys.path.insert(0, str(_HOME / "carla/PythonAPI/carla"))
+sys.path.insert(0, str(_HOME / "carla/PythonAPI/carla/agents"))
 
 import carla
 import py_trees
@@ -65,17 +69,19 @@ class AdaptTrustConfig:
 # ---------------------------------------------------------------------------
 
 class EgoBasicAgentBehavior(BasicAgentBehavior):
-    """BasicAgentBehavior with guaranteed ignore_traffic_lights option."""
+    """BasicAgentBehavior with ignore_traffic_lights and ignore_vehicles options."""
 
     def __init__(self, actor, target_location, target_speed, ignore_tl=True,
-                 name="EgoBasicAgent"):
+                 ignore_vehicles=False, name="EgoBasicAgent"):
         super().__init__(actor, target_location=target_location,
                          target_speed=target_speed, name=name)
-        self._ignore_tl = ignore_tl
+        self._ignore_tl       = ignore_tl
+        self._ignore_vehicles = ignore_vehicles
 
     def initialise(self):
         super().initialise()
         self._agent.ignore_traffic_lights(active=self._ignore_tl)
+        self._agent.ignore_vehicles(active=self._ignore_vehicles)
 
 
 class HoldThrottle(AtomicBehavior):
@@ -207,21 +213,58 @@ class SetAllTLsToState(AtomicBehavior):
         return py_trees.common.Status.SUCCESS
 
 
-class SafeLaneChange(LaneChange):
+class DirectLaneChange(AtomicBehavior):
     """
-    LaneChange with _pos_before_lane_change pre-seeded in initialise().
+    Steer NPC into an adjacent lane using raw VehicleControl — no Blackboard
+    / ActorsWithController dependency.
 
-    The upstream LaneChange.update() crashes with NoneType if the actor has
-    already drifted into the target lane before the first update() tick
-    (which happens when AccelerateToCatchUp drove with steer=0 on a curve).
-    Seeding the position here prevents the distance(Location, NoneType) error.
+    Phase 1 (ticks_steer ticks): apply lateral steer + throttle to drift across.
+    Phase 2 (ticks_straight ticks): neutralise steer so the NPC tracks straight
+    in the new lane before returning SUCCESS.
     """
+
+    def __init__(self, actor, direction='right', speed_mps=22.0,
+                 steer=0.10, ticks_steer=40, ticks_straight=20,
+                 name="DirectLaneChange"):
+        super().__init__(name, actor)
+        # CARLA convention: positive steer = LEFT, negative steer = RIGHT
+        self._steer_val = -steer if direction == 'right' else steer
+        self._speed_mps = speed_mps
+        self._ticks_steer = ticks_steer
+        self._ticks_straight = ticks_straight
+        self._count = 0
 
     def initialise(self):
-        super().initialise()
-        if self._pos_before_lane_change is None:
-            wp = CarlaDataProvider.get_map().get_waypoint(self._actor.get_location())
-            self._pos_before_lane_change = wp.transform.location
+        self._count = 0
+
+    def update(self):
+        if not (self._actor and self._actor.is_alive):
+            return py_trees.common.Status.SUCCESS
+
+        v = self._actor.get_velocity()
+        cur_spd = math.sqrt(v.x**2 + v.y**2 + v.z**2)
+
+        if self._count < self._ticks_steer:
+            if cur_spd > self._speed_mps * 1.05:
+                # Brake to target speed before/during lane change
+                ctrl = carla.VehicleControl(throttle=0.0, steer=self._steer_val,
+                                            brake=0.5)
+            else:
+                throttle = 0.4 if cur_spd < self._speed_mps else 0.0
+                ctrl = carla.VehicleControl(throttle=throttle,
+                                            steer=self._steer_val, brake=0.0)
+        else:
+            # Straighten out — hold speed
+            throttle = 0.4 if cur_spd < self._speed_mps else 0.0
+            ctrl = carla.VehicleControl(throttle=throttle, steer=0.0, brake=0.0)
+
+        self._actor.apply_control(ctrl)
+        self._count += 1
+
+        total = self._ticks_steer + self._ticks_straight
+        return (py_trees.common.Status.SUCCESS
+                if self._count >= total
+                else py_trees.common.Status.RUNNING)
 
 
 class ForceLaneChange(AtomicBehavior):
@@ -235,6 +278,131 @@ class ForceLaneChange(AtomicBehavior):
         if self._actor and self._actor.is_alive:
             self._tm.force_lane_change(self._actor, False)   # False = change RIGHT
         return py_trees.common.Status.SUCCESS
+
+
+class PrintSpeedCheckpoint(AtomicBehavior):
+    """
+    Prints ego speed + position on the first tick, then returns SUCCESS
+    so a Sequence can advance immediately to the next step.
+    """
+
+    def __init__(self, ego, label, name="PrintCheckpoint"):
+        super().__init__(name, ego)
+        self._label = label
+        self._done  = False
+
+    def update(self):
+        if not self._done:
+            v   = self._actor.get_velocity()
+            spd = math.sqrt(v.x**2 + v.y**2 + v.z**2) * 3.6
+            loc = self._actor.get_location()
+            print(f"[L3 CHECKPOINT] {self._label}: "
+                  f"speed={spd:.1f} km/h  x={loc.x:.1f} y={loc.y:.1f}")
+            self._done = True
+        return py_trees.common.Status.SUCCESS
+
+
+class NarrowStreetDriver(AtomicBehavior):
+    """
+    L3 ego driver combining three behaviours in one atomic:
+
+    1. ROUTING  — BasicAgent plans the route and handles steering for road curves.
+    2. SPEED    — drops to slow_speed within slow_dist of any parked NPC, then
+                  recovers to normal_speed once clear.
+    3. WEAVE    — adds a lateral steer correction that pushes the ego away from
+                  whichever side each NPC is on, creating a visible slalom effect.
+
+    NPC layout (±2.5 m offset): cars sit at the road shoulder.  The weave is
+    cosmetic — ego safely passes without correction — but adds visible lateral
+    deviation that justifies the spatial-reasoning explanation condition.
+
+    Steer correction: negate copysign so the correction opposes the NPC's side.
+    NPC to the right (lat_comp > 0)  →  −correction (steer left / away)
+    NPC to the left  (lat_comp < 0)  →  +correction (steer right / away)
+    """
+
+    def __init__(self, ego, dest, normal_speed, slow_speed, npcs,
+                 slow_dist=14.0, avoid_dist=18.0, steer_gain=0.12,
+                 name="NarrowStreetDriver"):
+        super().__init__(name, ego)
+        self._dest         = dest
+        self._normal_speed = normal_speed
+        self._slow_speed   = slow_speed
+        self._npcs         = [(i, n) for i, n in enumerate(npcs) if n is not None]
+        self._slow_dist    = slow_dist
+        self._avoid_dist   = avoid_dist
+        self._steer_gain   = steer_gain
+        self._logged       = set()
+        self._agent        = None
+
+    def initialise(self):
+        from agents.navigation.basic_agent import BasicAgent
+        self._agent = BasicAgent(self._actor, target_speed=self._normal_speed)
+        self._agent.ignore_traffic_lights(active=True)
+        self._agent.ignore_vehicles(active=True)
+        self._agent.set_destination(self._dest)
+        self._logged.clear()
+
+    def update(self):
+        if not (self._actor and self._actor.is_alive):
+            return py_trees.common.Status.SUCCESS
+
+        ego_t   = self._actor.get_transform()
+        ego_loc = ego_t.location
+        fwd     = ego_t.get_forward_vector()
+        right   = ego_t.get_right_vector()
+
+        min_dist         = float('inf')
+        steer_correction = 0.0
+
+        for i, npc in self._npcs:
+            if not npc.is_alive:
+                continue
+            npc_loc = npc.get_location()
+            d = ego_loc.distance(npc_loc)
+
+            if d < min_dist:
+                min_dist = d
+
+            # One-shot checkpoint log when entering slow zone
+            if d <= self._slow_dist and i not in self._logged:
+                v   = self._actor.get_velocity()
+                spd = math.sqrt(v.x**2 + v.y**2 + v.z**2) * 3.6
+                # Determine actual side from geometry (works for any layout)
+                dx = npc_loc.x - ego_loc.x
+                dy = npc_loc.y - ego_loc.y
+                lat = dx * right.x + dy * right.y
+                side = 'right' if lat > 0 else 'left'
+                print(f"[L3 CHECKPOINT] NPC{i+1} ({side}): "
+                      f"speed={spd:.1f} km/h  "
+                      f"x={ego_loc.x:.1f} y={ego_loc.y:.1f}")
+                self._logged.add(i)
+
+            # Lateral correction only for NPCs within avoid_dist and ahead of ego
+            if d > self._avoid_dist:
+                continue
+            dx = npc_loc.x - ego_loc.x
+            dy = npc_loc.y - ego_loc.y
+            if dx * fwd.x + dy * fwd.y < -4.0:   # NPC is behind — skip
+                continue
+
+            # Which side is the NPC?  positive lat_comp = NPC is to the RIGHT
+            lat_comp = dx * right.x + dy * right.y
+            strength = (self._avoid_dist - d) / self._avoid_dist   # 1→0 as d→avoid_dist
+
+            # Steer away from the NPC (negate: CARLA positive steer = RIGHT)
+            steer_correction += -math.copysign(1.0, lat_comp) * strength * self._steer_gain
+
+        # Speed
+        target_spd = (self._slow_speed if min_dist < self._slow_dist
+                      else self._normal_speed)
+        self._agent.set_target_speed(target_spd)
+
+        # Apply base control + lateral correction
+        ctrl = self._agent.run_step()
+        ctrl.steer = max(-1.0, min(1.0, ctrl.steer + steer_correction))
+        self._actor.apply_control(ctrl)
+        return py_trees.common.Status.RUNNING
 
 
 # ---------------------------------------------------------------------------
@@ -273,7 +441,7 @@ class AdaptTrustScenario(BasicScenario):
     """
 
     freeze_tls     = True
-    target_speed   = 40.0    # km/h
+    target_speed   = 50.0    # km/h
     duration       = 20.0    # seconds
     critical_event = None    # override in HIGH criticality subclasses
 
@@ -332,10 +500,10 @@ class AdaptTrustScenario(BasicScenario):
 # ===========================================================================
 
 class L1_GreenLightCruise(AdaptTrustScenario):
-    """Town03 — drive at 40 km/h through all-green lights for 20 s."""
+    """Town03 — drive at 50 km/h through all-green lights for 20 s."""
 
     duration     = 20.0
-    target_speed = 40.0
+    target_speed = 50.0
 
     def _do_create_behavior(self):
         return EgoBasicAgentBehavior(
@@ -344,44 +512,13 @@ class L1_GreenLightCruise(AdaptTrustScenario):
 
 
 class L2_SlowLeadOvertake(AdaptTrustScenario):
-    """Town04 — slow lead NPC at ~35 km/h; ego follows and decelerates. Speed adjustment is the key observable event."""
+    """
+    Town04 — slow NPC (~20 km/h) is 70 m ahead; ego cruises at 60 km/h,
+    catches up, changes lane to overtake, drives past, then merges back.
+    """
 
-    duration     = 25.0
+    duration     = 30.0
     target_speed = 60.0
-
-    def _do_initialize_actors(self, world):
-        bp_lib = world.get_blueprint_library()
-        car_bps = [b for b in bp_lib.filter("vehicle.*")
-                   if b.get_attribute("number_of_wheels").as_int() == 4]
-        bp = car_bps[0] if car_bps else bp_lib.filter("vehicle.*")[0]
-
-        ego_wp    = world.get_map().get_waypoint(self._ego().get_location())
-        ahead_wps = ego_wp.next(30.0)
-        if ahead_wps:
-            t = ahead_wps[0].transform
-            t.location.z += 0.5
-            npc = world.try_spawn_actor(bp, t)
-            if npc:
-                self._lead_npc = npc
-                self.other_actors.append(npc)
-                # TM: drive at ~20 km/h (speed_difference is % below limit)
-                tm = CarlaDataProvider.get_client().get_trafficmanager(CarlaDataProvider.get_traffic_manager_port())
-                npc.set_autopilot(True, tm.get_port())
-                tm.vehicle_percentage_speed_difference(npc, 60)  # 60% below limit ≈ 20 km/h
-                tm.ignore_lights_percentage(npc, 100)
-                tm.auto_lane_change(npc, False)
-
-    def _do_create_behavior(self):
-        return EgoBasicAgentBehavior(
-            self._ego(), self._dest(), self.target_speed, ignore_tl=True,
-            name="L2_Drive")
-
-
-class L3_NarrowStreetNav(AdaptTrustScenario):
-    """Town02 — navigate narrow urban streets at 20 km/h past 4 parked cars for 20 s."""
-
-    duration     = 20.0
-    target_speed = 20.0
 
     def _do_initialize_actors(self, world):
         bp_lib  = world.get_blueprint_library()
@@ -389,34 +526,205 @@ class L3_NarrowStreetNav(AdaptTrustScenario):
                    if b.get_attribute("number_of_wheels").as_int() == 4]
         bp = car_bps[0] if car_bps else bp_lib.filter("vehicle.*")[0]
 
-        ego     = self._ego()
-        ego_wp  = world.get_map().get_waypoint(ego.get_location())
+        ego_wp    = world.get_map().get_waypoint(self._ego().get_location())
+        ahead_wps = ego_wp.next(70.0)   # far enough for ego to cruise before closing
+        if not ahead_wps:
+            self._lead_npc = None
+            print("[L2] WARNING: no waypoint 70 m ahead — no NPC spawned")
+            return
 
-        dist = 30.0
-        for i in range(4):
+        t = carla.Transform(
+            ahead_wps[0].transform.location + carla.Location(z=0.5),
+            ahead_wps[0].transform.rotation)
+        npc = world.try_spawn_actor(bp, t)
+        if not npc:
+            self._lead_npc = None
+            print("[L2] WARNING: NPC spawn failed")
+            return
+
+        self._lead_npc = npc
+        self.other_actors.append(npc)
+        CarlaDataProvider.register_actor(npc, t)
+        CarlaDataProvider._carla_actor_pool[npc.id] = npc
+        world.tick()
+        CarlaDataProvider.on_carla_tick()
+        # Town04 speed limit ≈ 90 km/h → 78 % below ≈ 20 km/h
+        tm = CarlaDataProvider.get_client().get_trafficmanager(
+            CarlaDataProvider.get_traffic_manager_port())
+        npc.set_autopilot(True, tm.get_port())
+        tm.vehicle_percentage_speed_difference(npc, 78)
+        tm.ignore_lights_percentage(npc, 100)
+        tm.auto_lane_change(npc, False)
+        print(f"[L2] Lead NPC id={npc.id} spawned 70 m ahead at ~20 km/h")
+
+    def _do_create_behavior(self):
+        from srunner.scenariomanager.timer import TimeOut as TOut
+
+        ego  = self._ego()
+        npc  = getattr(self, "_lead_npc", None)
+        dest = self._dest(2000.0)
+        spd  = self.target_speed / 3.6   # m/s
+
+        seq = py_trees.composites.Sequence("L2_SlowLeadOvertake")
+
+        # Phase 1 — cruise at 60 km/h until within 15 m of the slow NPC
+        phase1 = py_trees.composites.Parallel(
+            "L2_Phase1_Approach",
+            policy=py_trees.common.ParallelPolicy.SUCCESS_ON_ONE)
+        phase1.add_child(EgoBasicAgentBehavior(ego, dest, self.target_speed,
+                                               ignore_tl=True, name="L2_Cruise"))
+        if npc:
+            phase1.add_child(InTriggerDistanceToVehicle(
+                ego, npc, 15.0, name="L2_CloseEnough"))
+        phase1.add_child(TOut(12.0, name="L2_Phase1Timeout"))
+        seq.add_child(phase1)
+
+        # Phase 2 — brake to 20 km/h then change to left lane
+        # Low speed keeps yaw change small so BasicAgent can recover cleanly
+        seq.add_child(DirectLaneChange(ego, direction='right',
+                                       speed_mps=20.0 / 3.6,
+                                       steer=0.05, ticks_steer=35, ticks_straight=30,
+                                       name="L2_OvertakeLaneChange"))
+
+        # Phase 3 — drive past NPC in left lane (ignore vehicles so no slowdown)
+        phase3 = py_trees.composites.Parallel(
+            "L2_Phase3_Pass",
+            policy=py_trees.common.ParallelPolicy.SUCCESS_ON_ONE)
+        phase3.add_child(EgoBasicAgentBehavior(ego, dest, self.target_speed,
+                                               ignore_tl=True, ignore_vehicles=True,
+                                               name="L2_OvertakeDrive"))
+        phase3.add_child(DriveDistance(ego, 60.0, name="L2_PassDist"))
+        phase3.add_child(TOut(6.0, name="L2_Phase3Timeout"))
+        seq.add_child(phase3)
+
+        # Phase 4 — brake to 20 km/h then merge back into right lane
+        seq.add_child(DirectLaneChange(ego, direction='left',
+                                       speed_mps=20.0 / 3.6,
+                                       steer=0.05, ticks_steer=35, ticks_straight=30,
+                                       name="L2_MergeBack"))
+
+        # Phase 5 — resume normal cruise
+        seq.add_child(EgoBasicAgentBehavior(ego, dest, self.target_speed,
+                                            ignore_tl=True, name="L2_Resume"))
+        return seq
+
+
+class L3_NarrowStreetNav(AdaptTrustScenario):
+    """
+    Town02 — ego drives at 15 km/h through a narrow street with 4 parked cars.
+    Cars alternate right/left, each shifted 0.8 m into the lane from its side,
+    forcing the ego to slow and squeeze past each one.
+
+    Telemetry: prints [L3 CHECKPOINT] NPC1-4 with dist and speed each time
+    the ego gets within 10 m of a parked car.
+
+    Ideal behaviour:
+      t≈ 5 s — approaches NPC1 (right), brakes to ~6-10 km/h, CHECKPOINT fires
+      t≈ 9 s — clears NPC1, returns to ~13-15 km/h
+      t≈12 s — NPC2 (left), slows again
+      t≈17 s — NPC3 (right), t≈22 s — NPC4 (left)
+      t=30 s — scenario ends
+    """
+
+    duration     = 30.0
+    target_speed = 50.0   # km/h cruise speed
+
+    # Preferred blueprints — variety of makes/sizes so parked cars look different.
+    # Falls back gracefully if a blueprint isn't available in this CARLA build.
+    _PARKED_BLUEPRINTS = [
+        "vehicle.tesla.model3",
+        "vehicle.audi.tt",
+        "vehicle.chevrolet.impala",
+        "vehicle.lincoln.mkz_2017",
+        "vehicle.bmw.grandtourer",
+        "vehicle.toyota.prius",
+        "vehicle.ford.mustang",
+        "vehicle.seat.leon",
+    ]
+
+    def _do_initialize_actors(self, world):
+        bp_lib  = world.get_blueprint_library()
+        car_bps = [b for b in bp_lib.filter("vehicle.*")
+                   if b.get_attribute("number_of_wheels").as_int() == 4]
+
+        # Build a pool of distinct blueprints, cycling through preferred list
+        bp_pool = []
+        for name in self._PARKED_BLUEPRINTS:
+            match = bp_lib.find(name) if bp_lib.find(name) else None
+            if match:
+                bp_pool.append(match)
+        if not bp_pool:
+            bp_pool = car_bps   # fallback: use whatever is available
+        # Deduplicate by id, preserve order
+        seen = set()
+        bp_pool = [b for b in bp_pool if not (b.id in seen or seen.add(b.id))]
+
+        ego    = self._ego()
+        ego_wp = world.get_map().get_waypoint(ego.get_location())
+
+        # Layout: (distance_m, side_sign)
+        #   side_sign = -1 → LEFT side, +1 → RIGHT side
+        layout = [
+            (10.0, -1),   # NPC1  — left
+            (20.0, -1),   # NPC2  — left
+            (30.0, -1),   # NPC3  — left
+            # ~35-55 m is the turn — no cars there (cause crashes)
+            (66.0, -1),   # NPC4  — left (post-turn straight)
+            (78.0,  1),   # NPC5  — right
+            (90.0, -1),   # NPC6  — left
+            (102.0, 1),   # NPC7  — right
+            (114.0, -1),  # NPC8  — left
+        ]
+
+        self._parked_npcs = []
+        for i, (dist, sign) in enumerate(layout):
             ahead_wps = ego_wp.next(dist)
             if not ahead_wps:
-                dist += 15.0
+                self._parked_npcs.append(None)
+                print(f"[L3] WARNING: no waypoint at dist={dist:.0f}m — NPC{i+1} skipped")
                 continue
+
             wp    = ahead_wps[0]
             right = wp.transform.get_right_vector()
-            side  = 1.5 if i % 2 == 0 else -1.5   # alternate right/left
-            loc   = carla.Location(
+            # 2.5 m offset clears ego collision mesh (ego half ~1.0m + NPC half ~0.9m
+            # = 1.9m minimum; 2.5m gives 0.6m air gap at lane centre).
+            side = sign * 2.5
+            loc  = carla.Location(
                 x=wp.transform.location.x + side * right.x,
                 y=wp.transform.location.y + side * right.y,
                 z=wp.transform.location.z + 0.3,
             )
-            t   = carla.Transform(loc, wp.transform.rotation)
-            npc = world.try_spawn_actor(bp, t)
+            t      = carla.Transform(loc, wp.transform.rotation)
+            bp     = bp_pool[i % len(bp_pool)]   # rotate through blueprints
+            npc    = world.try_spawn_actor(bp, t)
             if npc:
                 npc.set_simulate_physics(False)
                 npc.set_autopilot(False)
                 self.other_actors.append(npc)
-            dist += 15.0
+                CarlaDataProvider.register_actor(npc, t)
+                CarlaDataProvider._carla_actor_pool[npc.id] = npc
+                self._parked_npcs.append(npc)
+                label = 'left' if sign < 0 else 'right'
+                print(f"[L3] NPC{i+1} ({bp.id}) spawned at dist={dist:.0f}m {label}  "
+                      f"x={loc.x:.1f} y={loc.y:.1f}")
+            else:
+                self._parked_npcs.append(None)
+                print(f"[L3] WARNING: NPC{i+1} spawn FAILED at dist={dist:.0f}m "
+                      f"x={loc.x:.1f} y={loc.y:.1f} — skipped")
+
+        world.tick()
+        CarlaDataProvider.on_carla_tick()
 
     def _do_create_behavior(self):
-        return EgoBasicAgentBehavior(
-            self._ego(), self._dest(), self.target_speed, ignore_tl=True,
+        return NarrowStreetDriver(
+            ego=self._ego(),
+            dest=self._dest(200.0),
+            normal_speed=self.target_speed,   # 50 km/h cruise
+            slow_speed=10.0,                   # 10 km/h past each car
+            npcs=getattr(self, "_parked_npcs", []),
+            slow_dist=25.0,    # start braking 25 m before each NPC
+            avoid_dist=30.0,   # start weave correction at 30 m
+            steer_gain=0.22,   # lateral steer bias (~0.55 m lateral shift at peak)
             name="L3_Drive")
 
 
@@ -428,7 +736,7 @@ class M1_YellowLightStop(AdaptTrustScenario):
     """Town03 — TL turns Yellow at t=8 s; BasicAgent sees it and brakes gently."""
 
     duration     = 20.0
-    target_speed = 40.0
+    target_speed = 50.0
     freeze_tls   = True   # start GREEN, flip one to YELLOW at t=8s via behavior
 
     def _do_create_behavior(self):
@@ -693,17 +1001,19 @@ class H2_HighwayCutIn(AdaptTrustScenario):
         ego_wp = world.get_map().get_waypoint(ego.get_location())
 
         # Find an adjacent same-direction driving lane from ego's current position
-        adj_wp = ego_wp.get_left_lane()
-        if adj_wp is None or adj_wp.lane_type != carla.LaneType.Driving:
-            adj_wp = ego_wp.get_right_lane()
+        left_wp  = ego_wp.get_left_lane()
+        right_wp = ego_wp.get_right_lane()
+        _used_left = (left_wp is not None and
+                      left_wp.lane_type == carla.LaneType.Driving)
+        adj_wp = left_wp if _used_left else right_wp
         if adj_wp is None or adj_wp.lane_type != carla.LaneType.Driving:
             self._npc = None
             self._npc_cut_direction = 'right'
             print("[H2] WARNING: No adjacent driving lane found")
             return
 
-        # NPC cuts toward ego: if adj is left lane → NPC cuts RIGHT; if right → cuts LEFT
-        self._npc_cut_direction = 'right' if adj_wp == ego_wp.get_left_lane() else 'left'
+        # NPC cuts toward ego: if spawned in left lane → cuts RIGHT; if right lane → cuts LEFT
+        self._npc_cut_direction = 'right' if _used_left else 'left'
 
         # Spawn NPC 40 m BEHIND ego in the adjacent lane so it can visibly catch up
         behind_wps = adj_wp.previous(40.0)
@@ -779,12 +1089,10 @@ class H2_HighwayCutIn(AdaptTrustScenario):
             "H2_Phase2_CutIn",
             policy=py_trees.common.ParallelPolicy.SUCCESS_ON_ALL)
         if npc:
-            phase2.add_child(SafeLaneChange(
+            phase2.add_child(DirectLaneChange(
                 npc,
-                speed=None,                # keep current speed
                 direction=cut_dir,
-                distance_same_lane=5,
-                distance_other_lane=300,
+                speed_mps=self.target_speed / 3.6,   # keep near-highway speed
                 name="H2_LaneChange"))
         phase2.add_child(ForceEgoBrake(ego, ticks=40, brake=1.0,
                                        name="H2_EmergencyBrake"))
@@ -963,6 +1271,320 @@ class H3_RedLightRunner(AdaptTrustScenario):
         return seq
 
 
+# ===========================================================================
+# NEW SCENARIOS — S1–S5 (AdaptTrust invisible-trigger study)
+# ===========================================================================
+
+class S1_JaywalkingAdult(AdaptTrustScenario):
+    """
+    Town02 — adult pedestrian steps out from behind a parked car mid-block.
+    Ego cruises at 25 km/h, soft-brakes to a stop, waits for pedestrian to
+    clear, then resumes.
+
+    Layout (top-down):
+      Parked car : 28 m ahead of spawn, 2.5 m lateral (waypoint-snapped, occluder)
+      Walker     : 30 m ahead of spawn, 4.0 m RIGHT (hidden behind parked car)
+      Walker walks LEFT (-right_vector) at 1.4 m/s (casual adult pace)
+
+    Timing (@ 20 Hz, 25 km/h = 6.94 m/s, measured CARLA decel at brake=0.65: ~2.07 m/s²):
+      t= 0.0–2.0 s  Phase 1  warmup TOut(2s); ego covers ~13.9 m, gap to walker=16.1 m
+      t= 2.0 s      Phase 2  ForceEgoBrake(0.65, 70 ticks=3.5s) simultaneous with
+                             KeepWalkerMoving(1.4 m/s, 70 ticks=3.5s)
+                             ego stops in ~3.4 s covering ~11.8 m → gap to walker ~4.3 m ✓
+                             walker emerges from behind car at t≈2.7s (YOLO detects)
+      t= 5.5 s      Phase 3  KeepWalkerMoving(1.4 m/s, 40 ticks=2s) walker clears lane
+      t= 7.5 s      Phase 4  EgoBasicAgentBehavior resumes to t=20 s
+    """
+
+    duration     = 20.0
+    target_speed = 25.0   # km/h
+
+    # Preferred blueprints for the parked occluder car
+    _PARKED_PREF = [
+        "vehicle.toyota.prius",
+        "vehicle.audi.tt",
+        "vehicle.seat.leon",
+        "vehicle.tesla.model3",
+        "vehicle.chevrolet.impala",
+    ]
+
+    def _do_initialize_actors(self, world):
+        bp_lib = world.get_blueprint_library()
+
+        ego_t = self._ego().get_transform()
+        fwd   = ego_t.get_forward_vector()
+        right = ego_t.get_right_vector()
+
+        # ----------------------------------------------------------------
+        # Parked car — occluder on the right side of the road
+        # Physics disabled so it stays perfectly still and doesn't roll.
+        # Offset 2.5 m right places it against the kerb on Town02's ~4m road.
+        # ----------------------------------------------------------------
+        parked_bp = None
+        for name in self._PARKED_PREF:
+            bp = bp_lib.find(name)
+            if bp:
+                parked_bp = bp
+                break
+        if parked_bp is None:
+            car_bps = [b for b in bp_lib.filter("vehicle.*")
+                       if b.get_attribute("number_of_wheels").as_int() == 4]
+            if car_bps:
+                parked_bp = car_bps[0]
+
+        self._parked_car = None
+        if parked_bp:
+            # LEFT kerb: +2.5 × right_vector (right.x ≈ -1 for northbound Town02,
+            # so +2.5*right.x shifts the car ~2.5 m to the LEFT/west kerb).
+            # Keep PARK_DIST ≤ 22 m — building wall blocks left-side spawns above ~25 m.
+            PARK_DIST = 15.0
+            ego_wp    = world.get_map().get_waypoint(self._ego().get_location())
+            park_wps  = ego_wp.next(PARK_DIST)
+            if park_wps:
+                wp      = park_wps[0]
+                # Use the oncoming (left) lane centre — well-defined CARLA position
+                # clear of the building wall that blocks kerb-offset spawns on left side.
+                left_wp = wp.get_left_lane()
+                if left_wp is None:
+                    left_wp = wp          # fallback: same lane centre
+                park_loc = carla.Location(
+                    x=left_wp.transform.location.x,
+                    y=left_wp.transform.location.y,
+                    z=left_wp.transform.location.z + 0.3,
+                )
+                park_tf = carla.Transform(park_loc, left_wp.transform.rotation)
+                npc     = world.try_spawn_actor(parked_bp, park_tf)
+                if npc:
+                    npc.set_simulate_physics(False)
+                    npc.set_autopilot(False)
+                    self._parked_car = npc
+                    self.other_actors.append(npc)
+                    CarlaDataProvider.register_actor(npc, park_tf)
+                    CarlaDataProvider._carla_actor_pool[npc.id] = npc
+                    print(f"[S1] Parked car ({parked_bp.id})  "
+                          f"+{PARK_DIST:.0f}m fwd  left-lane  "
+                          f"x={park_loc.x:.1f} y={park_loc.y:.1f}")
+                else:
+                    print(f"[S1] WARNING: parked car spawn failed — no occluder")
+            else:
+                print(f"[S1] WARNING: no waypoint at {PARK_DIST}m ahead — no occluder")
+
+        # ----------------------------------------------------------------
+        # Walker — adult pedestrian, hidden behind the parked car.
+        # Spawned 4.0 m right so it clears the parked car's body (~1m half-width
+        # + 2.5m offset = 3.5m edge), giving ~0.5m clearance before physics.
+        # Walk direction is -right_vector (walks left, across the road).
+        # ----------------------------------------------------------------
+        walkers = list(bp_lib.filter("walker.pedestrian.*"))
+        # Prefer adult blueprints — avoid known child IDs
+        _CHILD = {"walker.pedestrian.0008", "walker.pedestrian.0012",
+                  "walker.pedestrian.0014", "walker.pedestrian.0016"}
+        adult_bps  = [b for b in walkers if b.id not in _CHILD]
+        walker_bp  = adult_bps[0] if adult_bps else (walkers[0] if walkers else None)
+
+        self._walker    = None
+        self._walk_dir  = None
+        if walker_bp is None:
+            print("[S1] WARNING: no walker blueprint — scenario runs without pedestrian")
+            return
+
+        WALK_DIST = 22.0   # m ahead  (ego stops ~10m from spawn → ~12m gap to walker)
+        WALK_SIDE = -4.0   # m left   (spawn on left side, walks right across road)
+        walk_loc  = carla.Location(
+            x=ego_t.location.x + WALK_DIST * fwd.x + WALK_SIDE * right.x,
+            y=ego_t.location.y + WALK_DIST * fwd.y + WALK_SIDE * right.y,
+            z=ego_t.location.z + 0.5,
+        )
+        # Walk direction: perpendicular RIGHT across the road (reversed path)
+        self._walk_dir = carla.Vector3D(x=right.x, y=right.y, z=0.0)
+
+        walker = world.try_spawn_actor(
+            walker_bp,
+            carla.Transform(walk_loc,
+                            carla.Rotation(yaw=ego_t.rotation.yaw + 90)))
+        self._walker = walker
+        if walker:
+            self.other_actors.append(walker)
+            world.tick()
+            CarlaDataProvider.on_carla_tick()
+            print(f"[S1] Walker ({walker_bp.id})  "
+                  f"+{WALK_DIST:.0f}m fwd  +{WALK_SIDE:.1f}m right  "
+                  f"x={walk_loc.x:.1f} y={walk_loc.y:.1f}")
+        else:
+            print("[S1] WARNING: walker spawn failed")
+
+    def _do_create_behavior(self):
+        from srunner.scenariomanager.timer import TimeOut as TOut
+
+        ego  = self._ego()
+        dest = self._dest()
+        seq  = py_trees.composites.Sequence("S1_JaywalkingAdult")
+
+        # ---- Phase 1: warmup — ego accelerates to 25 km/h (2 s) ----
+        phase1 = py_trees.composites.Parallel(
+            "S1_Phase1_Approach",
+            policy=py_trees.common.ParallelPolicy.SUCCESS_ON_ONE)
+        phase1.add_child(EgoBasicAgentBehavior(ego, dest, self.target_speed,
+                                               ignore_tl=True, name="S1_Drive1"))
+        phase1.add_child(TOut(2.0, name="S1_WarmupTimer"))
+        seq.add_child(phase1)
+
+        walker_alive = getattr(self, "_walker", None) and self._walker.is_alive
+
+        # ---- Phase 2: walker steps out + ego soft-brakes (3.5 s / 70 ticks) ----
+        # brake=0.65, measured CARLA decel ≈ 2.07 m/s²
+        # From 25 km/h (6.94 m/s): stops in ~3.4 s, covers ~11.8 m
+        # Phase 1 covers 13.9 m → ego stops at ~25.7 m, walker at 30 m → gap ~4.3 m ✓
+        # Walker at 1.4 m/s for 3.5 s: moves 4.9 m left (4.0 right → 0.9 m left of centre)
+        phase2 = py_trees.composites.Parallel(
+            "S1_Phase2_CrossingEvent",
+            policy=py_trees.common.ParallelPolicy.SUCCESS_ON_ALL)
+        phase2.add_child(ForceEgoBrake(ego, ticks=70, brake=0.65,
+                                       name="S1_SoftBrake"))
+        if walker_alive:
+            phase2.add_child(KeepWalkerMoving(self._walker, self._walk_dir,
+                                              speed=1.4, ticks=70,
+                                              name="S1_WalkerStep"))
+        seq.add_child(phase2)
+
+        # ---- Phase 3: walker clears the lane (2 s / 40 ticks) ----
+        # After Phase 2: walker is 0.9 m left of centre, needs ~1.6 m more to clear
+        if walker_alive:
+            seq.add_child(KeepWalkerMoving(self._walker, self._walk_dir,
+                                           speed=1.4, ticks=40,
+                                           name="S1_WalkerClears"))
+
+        # ---- Phase 4: ego resumes, runs until duration (20 s) ----
+        seq.add_child(EgoBasicAgentBehavior(ego, dest, self.target_speed,
+                                            ignore_tl=True, name="S1_Resume"))
+        return seq
+
+
+# ---------------------------------------------------------------------------
+# S2 — Sudden Stop + Evasive Lane Change
+# ---------------------------------------------------------------------------
+
+class S2_SuddenStopEvasion(AdaptTrustScenario):
+    """
+    Town04 — NPC car is 70 m ahead, driven by WaypointFollower at 40 km/h.
+    Ego approaches at 60 km/h.  After 15 s (or when gap ≤ 20 m), the NPC
+    emergency-stops — reason not visible from the front camera (classic AV
+    unexplainability case).  Ego hard-brakes 60→20 km/h (~1.4 s), then
+    DirectLaneChange swerves into the adjacent lane.  EgoBasicAgentBehavior
+    resumes at 60 km/h through the Town04 highway curves.
+
+    Trigger fired:
+      BRAKING — brake=0.8 > 0.5, speed drop 60→20 km/h >> 5 km/h threshold
+    """
+
+    duration     = 30.0
+    target_speed = 60.0
+
+    def _do_initialize_actors(self, world):
+        bp_lib  = world.get_blueprint_library()
+        car_bps = [b for b in bp_lib.filter("vehicle.*")
+                   if b.get_attribute("number_of_wheels").as_int() == 4]
+        bp = car_bps[0] if car_bps else bp_lib.filter("vehicle.*")[0]
+
+        ego_wp    = world.get_map().get_waypoint(self._ego().get_location())
+        ahead_wps = ego_wp.next(70.0)
+        if not ahead_wps:
+            self._lead_npc = None
+            print("[S2] WARNING: no waypoint 70 m ahead — no NPC spawned")
+            return
+
+        t = carla.Transform(
+            ahead_wps[0].transform.location + carla.Location(z=0.5),
+            ahead_wps[0].transform.rotation)
+        npc = world.try_spawn_actor(bp, t)
+        if not npc:
+            self._lead_npc = None
+            print("[S2] WARNING: NPC spawn failed")
+            return
+
+        self._lead_npc = npc
+        self.other_actors.append(npc)
+        CarlaDataProvider.register_actor(npc, t)
+        CarlaDataProvider._carla_actor_pool[npc.id] = npc
+        world.tick()
+        CarlaDataProvider.on_carla_tick()
+        # Note: no TM autopilot — NPC is driven by WaypointFollower in the
+        # behavior tree (same pattern as H2_HighwayCutIn).
+        loc = npc.get_transform().location
+        print(f"[S2] Lead NPC id={npc.id} at x={loc.x:.1f} y={loc.y:.1f} "
+              f"(70 m ahead, WaypointFollower @ 40 km/h)")
+
+    def _do_create_behavior(self):
+        from srunner.scenariomanager.timer import TimeOut as TOut
+
+        ego = self._ego()
+        npc = getattr(self, "_lead_npc", None)
+        dest = self._dest(2000.0)
+
+        # Compute a right-lane dest so Phase 4 BasicAgent routes around the
+        # stopped NPC (which is in the original lane) rather than through it.
+        world = CarlaDataProvider.get_world()
+        dest_wp = world.get_map().get_waypoint(dest)
+        right_wp = dest_wp.get_right_lane()
+        phase4_dest = right_wp.transform.location if right_wp else dest
+
+        seq = py_trees.composites.Sequence("S2_SuddenStopEvasion")
+
+        # ---- Phase 1: both vehicles establish highway speed until gap ≤ 20 m ----
+        # WaypointFollower drives NPC at 40 km/h (reliable, no TM dependency).
+        # Starting gap ~70 m, closure rate ~20 km/h → triggers in ~9 s.
+        phase1 = py_trees.composites.Parallel(
+            "S2_Phase1_Approach",
+            policy=py_trees.common.ParallelPolicy.SUCCESS_ON_ONE)
+        phase1.add_child(EgoBasicAgentBehavior(ego, dest, self.target_speed,
+                                               ignore_tl=True, name="S2_Approach"))
+        if npc:
+            phase1.add_child(WaypointFollower(npc, 40.0 / 3.6, name="S2_NPCCruise"))
+            phase1.add_child(InTriggerDistanceToVehicle(
+                ego, npc, 20.0, name="S2_GapClose"))
+        phase1.add_child(TOut(15.0, name="S2_Phase1Timeout"))
+        seq.add_child(phase1)
+
+        # ---- Phase 2: NPC emergency stop + ego hard-brakes simultaneously ----
+        # From 60 km/h (16.67 m/s) at ~8 m/s² decel: 28 ticks → ~20 km/h.
+        # NPC from 40 km/h at brake=1.0: stops in ~28 ticks (1.4 s) as well.
+        # SUCCESS_ON_ONE fires when ego brake finishes; NPC gets persistent
+        # brake=1.0 control keeping it stopped.
+        brake_par2 = py_trees.composites.Parallel(
+            "S2_Phase2_Brake",
+            policy=py_trees.common.ParallelPolicy.SUCCESS_ON_ONE)
+        if npc:
+            brake_par2.add_child(ForceEgoBrake(npc, ticks=60, brake=1.0,
+                                               name="S2_NPCStop"))
+        brake_par2.add_child(ForceEgoBrake(ego, ticks=18, brake=0.8,
+                                           name="S2_EgoBrake"))
+        seq.add_child(brake_par2)
+
+        # ---- Phase 3: evasive lane change (~3.25 s) ----
+        # steer=0.07 at ~20 km/h matches L2's rate for one lane-width lateral
+        # shift. direction='right' = overtake (left) lane in Town04, per L2.
+        seq.add_child(DirectLaneChange(ego,
+                                       direction='right',
+                                       speed_mps=20.0 / 3.6,
+                                       steer=0.07,
+                                       ticks_steer=35, ticks_straight=30,
+                                       name="S2_EvasiveLaneChange"))
+
+        # ---- Phase 4: resume in the evasion lane ----
+        # Use phase4_dest (right-lane waypoint) so BasicAgent stays in the
+        # evasion lane and does not route back through the stopped NPC.
+        # TOut(12 s) fallback in case BasicAgent misbehaves after lane change.
+        phase4 = py_trees.composites.Parallel(
+            "S2_Phase4_Resume",
+            policy=py_trees.common.ParallelPolicy.SUCCESS_ON_ONE)
+        phase4.add_child(EgoBasicAgentBehavior(ego, phase4_dest, self.target_speed,
+                                               ignore_tl=True, ignore_vehicles=True,
+                                               name="S2_Resume"))
+        phase4.add_child(TOut(12.0, name="S2_Phase4Timeout"))
+        seq.add_child(phase4)
+
+        return seq
+
 # ---------------------------------------------------------------------------
 # Registry — maps scenario_id string → class
 # ---------------------------------------------------------------------------
@@ -977,6 +1599,8 @@ SCENARIO_REGISTRY = {
     "H1_PedestrianDart":    H1_PedestrianDart,
     "H2_HighwayCutIn":      H2_HighwayCutIn,
     "H3_RedLightRunner":    H3_RedLightRunner,
+    "S1_JaywalkingAdult":          S1_JaywalkingAdult,
+    "S2_SuddenStopEvasion":        S2_SuddenStopEvasion,
 }
 
 # Map: scenario_id → (map_name, spawn_index)
@@ -990,4 +1614,6 @@ SCENARIO_MAP = {
     "H1_PedestrianDart":    ("Town02", 0),
     "H2_HighwayCutIn":      ("Town04", 10),
     "H3_RedLightRunner":    ("Town03", 1),
+    "S1_JaywalkingAdult":          ("Town02", 0),
+    "S2_SuddenStopEvasion":        ("Town04", 10),
 }

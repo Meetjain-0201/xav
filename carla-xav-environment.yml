@@ -108,4 +108,4 @@ dependencies:
       - urllib3==2.6.3
 variables:
   PYTHONPATH: ''
-prefix: /home/meet/miniconda3/envs/carla-xav
+prefix: ~/miniconda3/envs/carla-xav

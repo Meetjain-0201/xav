@@ -124,11 +124,12 @@ class Recorder:
     def __enter__(self):
         self.trigger_dir.mkdir(parents=True, exist_ok=True)
 
-        logger.info("Loading YOLO model: %s", self._yolo_model_path)
+        logger.info("Loading YOLO model: %s (CPU — GPU reserved for CARLA)",
+                    self._yolo_model_path)
         self._yolo = YOLO(self._yolo_model_path)
         # Warm up the model with a dummy frame so first real frame isn't slow
         dummy = np.zeros((_VIDEO_HEIGHT, _VIDEO_WIDTH, 3), dtype=np.uint8)
-        self._yolo(dummy, verbose=False)
+        self._yolo(dummy, verbose=False, device="cpu")
         logger.info("YOLO warm-up complete.")
 
         video_path = str(self.output_dir / "video.mp4")
@@ -213,7 +214,7 @@ class Recorder:
             }
         """
         t0 = time.monotonic()
-        results = self._yolo(bgr, verbose=False, conf=self.conf)
+        results = self._yolo(bgr, verbose=False, conf=self.conf, device="cpu")
         inference_ms = (time.monotonic() - t0) * 1000
 
         detections = []

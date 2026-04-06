@@ -25,10 +25,11 @@ import py_trees
 
 # ---- project paths --------------------------------------------------------
 _ROOT = Path(__file__).resolve().parents[1]
+_HOME = Path.home()
 sys.path.insert(0, str(_ROOT))
-sys.path.insert(0, "/home/meet/scenario_runner")
-sys.path.insert(0, "/home/meet/carla/PythonAPI/carla")
-sys.path.insert(0, "/home/meet/carla/PythonAPI/carla/agents")
+sys.path.insert(0, str(_HOME / "scenario_runner"))
+sys.path.insert(0, str(_HOME / "carla/PythonAPI/carla"))
+sys.path.insert(0, str(_HOME / "carla/PythonAPI/carla/agents"))
 
 import carla
 from srunner.scenariomanager.carla_data_provider import CarlaDataProvider
