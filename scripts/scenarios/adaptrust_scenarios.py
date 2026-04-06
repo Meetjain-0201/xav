@@ -1856,6 +1856,159 @@ class S4_EmergencyVehiclePullOver(AdaptTrustScenario):
         return seq
 
 
+# ---------------------------------------------------------------------------
+# S5 — Partially-Hidden Cyclist
+# ---------------------------------------------------------------------------
+
+class S5_HiddenCyclist(AdaptTrustScenario):
+    """
+    Town02 — A slow cyclist (bicycle vehicle) rides 25 m ahead of ego at
+    8 km/h.  A parked sedan (right kerb, 18 m ahead) partially obscures the
+    cyclist from the front camera until ego is within ~10 m.  Ego approaches
+    at 30 km/h; a ForceEgoBrake fires the BRAKING trigger when the gap
+    closes to ≤ 12 m.  After braking, BasicAgent resumes and overtakes the
+    slow cyclist.
+
+    Unexplainability: until the parked car is passed, the bicycle is not
+    clearly visible from the forward camera.  The AV brakes earlier than a
+    human observer might expect.
+
+    Triggers fired:
+      BRAKING — brake=0.9 >> 0.5, speed drop >> 5 km/h
+    """
+
+    duration     = 20.0
+    target_speed = 30.0
+
+    _PARK_DIST = 18.0   # m ahead — parked sedan (right kerb, same as L3/S1)
+    _BIKE_DIST = 25.0   # m ahead — cyclist in lane centre
+
+    def _do_initialize_actors(self, world):
+        bp_lib  = world.get_blueprint_library()
+        ego_wp  = world.get_map().get_waypoint(self._ego().get_location())
+
+        # ---- Parked sedan (right kerb — identical formula to S1 parked car) ----
+        # In Town02 spawn[0], get_right_vector() points LEFT/west, so subtracting
+        # 2.5× it moves the spawn point to the RIGHT/east kerb (proven in S1).
+        park_wps = ego_wp.next(self._PARK_DIST)
+        if park_wps:
+            park_wp   = park_wps[0]
+            right     = park_wp.transform.get_right_vector()
+            # Offset 1.0× right_vector puts sedan on lane edge — close enough
+            # to partially overlap the cyclist in the forward camera view while
+            # still being visually "parked to the side".
+            park_loc  = carla.Location(
+                x=park_wp.transform.location.x - 1.0 * right.x,
+                y=park_wp.transform.location.y - 1.0 * right.y,
+                z=park_wp.transform.location.z + 0.5)
+            sedan_bps = [b for b in bp_lib.filter("vehicle.*")
+                         if b.get_attribute("number_of_wheels").as_int() == 4
+                         and "truck" not in b.id and "bus" not in b.id]
+            sedan_bp  = sedan_bps[0] if sedan_bps else None
+            if sedan_bp:
+                park_t = carla.Transform(park_loc, park_wp.transform.rotation)
+                sedan  = world.try_spawn_actor(sedan_bp, park_t)
+                if sedan:
+                    sedan.set_simulate_physics(False)
+                    sedan.set_autopilot(False)
+                    self._sedan = sedan
+                    self.other_actors.append(sedan)
+                    CarlaDataProvider.register_actor(sedan, park_t)
+                    CarlaDataProvider._carla_actor_pool[sedan.id] = sedan
+                    print(f"[S5] Parked sedan ({sedan_bp.id}) id={sedan.id} "
+                          f"at x={park_loc.x:.1f} y={park_loc.y:.1f}")
+                else:
+                    self._sedan = None
+                    print("[S5] WARNING: sedan spawn failed — no occlusion")
+            else:
+                self._sedan = None
+        else:
+            self._sedan = None
+
+        # ---- Cyclist (moving bicycle in lane centre) ----
+        bike_wps = ego_wp.next(self._BIKE_DIST)
+        if bike_wps:
+            bike_wp  = bike_wps[0]
+            bike_loc = bike_wp.transform.location + carla.Location(z=0.3)
+            bike_bps = [b for b in bp_lib.filter("vehicle.*")
+                        if any(k in b.id for k in ("crossbike", "omafiets",
+                                                    "diamondback", "century"))]
+            bike_bp  = bike_bps[0] if bike_bps else None
+            if bike_bp:
+                bike_t = carla.Transform(bike_loc, bike_wp.transform.rotation)
+                bike   = world.try_spawn_actor(bike_bp, bike_t)
+                if bike:
+                    self._bike = bike
+                    self.other_actors.append(bike)
+                    CarlaDataProvider.register_actor(bike, bike_t)
+                    CarlaDataProvider._carla_actor_pool[bike.id] = bike
+                    print(f"[S5] Cyclist ({bike_bp.id}) id={bike.id} "
+                          f"at x={bike_loc.x:.1f} y={bike_loc.y:.1f}")
+                else:
+                    self._bike = None
+                    print("[S5] WARNING: bicycle spawn failed")
+            else:
+                self._bike = None
+                print("[S5] WARNING: no bicycle blueprint")
+        else:
+            self._bike = None
+
+    def _do_create_behavior(self):
+        from srunner.scenariomanager.timer import TimeOut as TOut
+
+        ego  = self._ego()
+        dest = self._dest(2000.0)
+        bike = getattr(self, "_bike", None)
+
+        seq = py_trees.composites.Sequence("S5_HiddenCyclist")
+
+        # ---- Phase 1: both ego and cyclist approach; trigger at 12 m gap ----
+        # WaypointFollower drives cyclist at 8 km/h.
+        # Closure rate 30−8=22 km/h; starting gap 25 m → 12 m gap in ~1.9 s.
+        phase1 = py_trees.composites.Parallel(
+            "S5_Phase1_Approach",
+            policy=py_trees.common.ParallelPolicy.SUCCESS_ON_ONE)
+        phase1.add_child(EgoBasicAgentBehavior(ego, dest, self.target_speed,
+                                               ignore_tl=True, name="S5_Approach"))
+        if bike:
+            phase1.add_child(WaypointFollower(bike, 8.0 / 3.6, name="S5_CyclistRide"))
+            phase1.add_child(InTriggerDistanceToVehicle(
+                ego, bike, 12.0, name="S5_CyclistClose"))
+        phase1.add_child(TOut(5.0, name="S5_Phase1Timeout"))
+        seq.add_child(phase1)
+
+        # ---- Phase 2: emergency brake + keep cyclist at 8 km/h ----
+        # WaypointFollower must continue here — without it the last throttle
+        # command from Phase 1 persists and the cyclist accelerates to 35 km/h.
+        phase2 = py_trees.composites.Parallel(
+            "S5_Phase2_Brake",
+            policy=py_trees.common.ParallelPolicy.SUCCESS_ON_ONE)
+        phase2.add_child(ForceEgoBrake(ego, ticks=40, brake=0.9,
+                                       name="S5_EmergencyBrake"))
+        if bike:
+            phase2.add_child(WaypointFollower(bike, 8.0 / 3.6,
+                                              avoid_collision=False,
+                                              name="S5_CyclistBrakePhase"))
+        seq.add_child(phase2)
+
+        # ---- Phase 3: resume at 30 km/h, overtaking the cyclist ----
+        # ignore_vehicles=True lets BasicAgent drive past the slow cyclist.
+        # WaypointFollower keeps cyclist at 8 km/h so ego can overtake cleanly.
+        phase3 = py_trees.composites.Parallel(
+            "S5_Phase3_Resume",
+            policy=py_trees.common.ParallelPolicy.SUCCESS_ON_ONE)
+        phase3.add_child(EgoBasicAgentBehavior(ego, dest, self.target_speed,
+                                               ignore_tl=True, ignore_vehicles=True,
+                                               name="S5_Resume"))
+        if bike:
+            phase3.add_child(WaypointFollower(bike, 8.0 / 3.6,
+                                              avoid_collision=False,
+                                              name="S5_CyclistResumePhase"))
+        phase3.add_child(TOut(10.0, name="S5_Phase3Timeout"))
+        seq.add_child(phase3)
+
+        return seq
+
 
 # ---------------------------------------------------------------------------
 # Registry — maps scenario_id string → class
@@ -1874,7 +2027,7 @@ SCENARIO_REGISTRY = {
     "S1_JaywalkingAdult":          S1_JaywalkingAdult,
     "S2_SuddenStopEvasion":        S2_SuddenStopEvasion,
     "S4_EmergencyVehiclePullOver": S4_EmergencyVehiclePullOver,
-
+    "S5_HiddenCyclist":            S5_HiddenCyclist,
 }
 
 # Map: scenario_id → (map_name, spawn_index)
@@ -1891,5 +2044,5 @@ SCENARIO_MAP = {
     "S1_JaywalkingAdult":          ("Town02", 0),
     "S2_SuddenStopEvasion":        ("Town04", 10),
     "S4_EmergencyVehiclePullOver": ("Town02", 0),
-
+    "S5_HiddenCyclist":            ("Town02", 0),
 }
