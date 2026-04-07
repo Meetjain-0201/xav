@@ -339,9 +339,10 @@ class NarrowStreetDriver(AtomicBehavior):
 
     def __init__(self, ego, dest, normal_speed, slow_speed, npcs,
                  slow_dist=14.0, avoid_dist=18.0, steer_gain=0.12,
-                 name="NarrowStreetDriver"):
+                 plan=None, name="NarrowStreetDriver"):
         super().__init__(name, ego)
         self._dest         = dest
+        self._plan         = plan
         self._normal_speed = normal_speed
         self._slow_speed   = slow_speed
         self._npcs         = [(i, n) for i, n in enumerate(npcs) if n is not None]
@@ -356,7 +357,14 @@ class NarrowStreetDriver(AtomicBehavior):
         self._agent = BasicAgent(self._actor, target_speed=self._normal_speed)
         self._agent.ignore_traffic_lights(active=True)
         self._agent.ignore_vehicles(active=True)
-        self._agent.set_destination(self._dest)
+        if self._plan is not None:
+            try:
+                self._agent.set_global_plan(self._plan, stop_waypoint_creation=True, clean_queue=True)
+            except TypeError:
+                # Older CARLA versions have different signature
+                self._agent.set_global_plan(self._plan)
+        else:
+            self._agent.set_destination(self._dest)
         self._logged.clear()
 
     def update(self):
@@ -377,7 +385,10 @@ class NarrowStreetDriver(AtomicBehavior):
             npc_loc = npc.get_location()
             d = ego_loc.distance(npc_loc)
 
-            if d < min_dist:
+            # Only update min_dist for NPCs ahead of ego — prevents slowing for passed cars
+            dx = npc_loc.x - ego_loc.x
+            dy = npc_loc.y - ego_loc.y
+            if dx * fwd.x + dy * fwd.y > 0 and d < min_dist:
                 min_dist = d
 
             # One-shot checkpoint log when entering slow zone
@@ -432,6 +443,46 @@ def _far_waypoint(world, actor, dist_m=3000.0):
     if wps:
         return wps[0].transform.location
     return world.get_map().get_spawn_points()[-1].location
+
+
+def _straight_waypoint(world, actor, dist_m=200.0):
+    """Walk dist_m ahead always choosing the waypoint most aligned with current
+    forward direction — avoids turns at junctions."""
+    wp  = world.get_map().get_waypoint(actor.get_location())
+    fwd = actor.get_transform().get_forward_vector()
+    traveled = 0.0
+    step = 2.0
+    while traveled < dist_m:
+        nexts = wp.next(step)
+        if not nexts:
+            break
+        wp = max(nexts, key=lambda w: (
+            w.transform.get_forward_vector().x * fwd.x +
+            w.transform.get_forward_vector().y * fwd.y
+        ))
+        traveled += step
+    return wp.transform.location
+
+
+def _straight_plan(world, actor, dist_m=200.0, step=2.0):
+    """Return a list of (waypoint, RoadOption.STRAIGHT) tuples walking straight
+    ahead — for use with BasicAgent.set_global_plan() to bypass route planner."""
+    from agents.navigation.local_planner import RoadOption
+    wp  = world.get_map().get_waypoint(actor.get_location())
+    fwd = actor.get_transform().get_forward_vector()
+    plan = []
+    traveled = 0.0
+    while traveled < dist_m:
+        nexts = wp.next(step)
+        if not nexts:
+            break
+        wp = max(nexts, key=lambda w: (
+            w.transform.get_forward_vector().x * fwd.x +
+            w.transform.get_forward_vector().y * fwd.y
+        ))
+        plan.append((wp, RoadOption.STRAIGHT))
+        traveled += step
+    return plan
 
 
 def _freeze_tls_green(world):
@@ -643,7 +694,7 @@ class L3_NarrowStreetNav(AdaptTrustScenario):
     """
 
     duration     = 30.0
-    target_speed = 50.0   # km/h cruise speed
+    target_speed = 60.0   # km/h cruise speed
 
     # Preferred blueprints — variety of makes/sizes so parked cars look different.
     # Falls back gracefully if a blueprint isn't available in this CARLA build.
@@ -675,21 +726,19 @@ class L3_NarrowStreetNav(AdaptTrustScenario):
         seen = set()
         bp_pool = [b for b in bp_pool if not (b.id in seen or seen.add(b.id))]
 
-        ego    = self._ego()
-        ego_wp = world.get_map().get_waypoint(ego.get_location())
+        # Use the original map spawn point as fixed reference so parked cars
+        # stay at their correct world positions even when ego spawns further back.
+        spawn_pts = world.get_map().get_spawn_points()
+        ego_wp = world.get_map().get_waypoint(spawn_pts[0].location)
 
         # Layout: (distance_m, side_sign)
         #   side_sign = -1 → LEFT side, +1 → RIGHT side
+        # Only 3 cars on the straight section — road turns right at ~35m
+        # so all post-turn cars are removed to keep scenario on straight road.
         layout = [
             (10.0, -1),   # NPC1  — left
             (20.0, -1),   # NPC2  — left
             (30.0, -1),   # NPC3  — left
-            # ~35-55 m is the turn — no cars there (cause crashes)
-            (66.0, -1),   # NPC4  — left (post-turn straight)
-            (78.0,  1),   # NPC5  — right
-            (90.0, -1),   # NPC6  — left
-            (102.0, 1),   # NPC7  — right
-            (114.0, -1),  # NPC8  — left
         ]
 
         self._parked_npcs = []
@@ -732,9 +781,12 @@ class L3_NarrowStreetNav(AdaptTrustScenario):
         CarlaDataProvider.on_carla_tick()
 
     def _do_create_behavior(self):
+        ego  = self._ego()
+        plan = _straight_plan(self.world, ego, dist_m=200.0)
         return NarrowStreetDriver(
-            ego=self._ego(),
-            dest=self._dest(200.0),
+            ego=ego,
+            dest=_straight_waypoint(self.world, ego, dist_m=200.0),
+            plan=plan,
             normal_speed=self.target_speed,   # 50 km/h cruise
             slow_speed=10.0,                   # 10 km/h past each car
             npcs=getattr(self, "_parked_npcs", []),
@@ -1645,8 +1697,9 @@ class S4_EmergencyVehiclePullOver(AdaptTrustScenario):
     Trigger: BRAKING
     """
 
-    duration     = 35.0
-    target_speed = 25.0
+    duration       = 35.0
+    target_speed   = 25.0
+    critical_event = "BRAKING"
 
     def _do_initialize_actors(self, world):
         bp_lib    = world.get_blueprint_library()
@@ -1886,14 +1939,14 @@ class S4_EmergencyVehiclePullOver(AdaptTrustScenario):
 
 class S5_HiddenCyclist(AdaptTrustScenario):
     """
-    Town02 — A slow cyclist (bicycle vehicle) rides 25 m ahead of ego at
-    8 km/h.  A parked sedan (right kerb, 18 m ahead) partially obscures the
-    cyclist from the front camera until ego is within ~10 m.  Ego approaches
+    Town02 — A slow cyclist (bicycle vehicle) rides 40 m ahead of ego at
+    8 km/h.  A parked truck (right kerb, 20 m ahead) partially obscures the
+    cyclist from the front camera until ego is within ~15 m.  Ego approaches
     at 30 km/h; a ForceEgoBrake fires the BRAKING trigger when the gap
-    closes to ≤ 12 m.  After braking, BasicAgent resumes and overtakes the
+    closes to ≤ 15 m.  After braking, BasicAgent resumes and overtakes the
     slow cyclist.
 
-    Unexplainability: until the parked car is passed, the bicycle is not
+    Unexplainability: until the parked truck is passed, the bicycle is not
     clearly visible from the forward camera.  The AV brakes earlier than a
     human observer might expect.
 
@@ -1901,49 +1954,50 @@ class S5_HiddenCyclist(AdaptTrustScenario):
       BRAKING — brake=0.9 >> 0.5, speed drop >> 5 km/h
     """
 
-    duration     = 20.0
+    duration     = 25.0
     target_speed = 30.0
 
-    _PARK_DIST = 18.0   # m ahead — parked sedan (right kerb, same as L3/S1)
-    _BIKE_DIST = 25.0   # m ahead — cyclist in lane centre
+    _PARK_DIST = 20.0   # m ahead — parked truck (right kerb)
+    _BIKE_DIST = 40.0   # m ahead — cyclist in lane centre
 
     def _do_initialize_actors(self, world):
         bp_lib  = world.get_blueprint_library()
         ego_wp  = world.get_map().get_waypoint(self._ego().get_location())
 
-        # ---- Parked sedan (right kerb — identical formula to S1 parked car) ----
+        # ---- Parked truck (right kerb) ----
         # In Town02 spawn[0], get_right_vector() points LEFT/west, so subtracting
         # 2.5× it moves the spawn point to the RIGHT/east kerb (proven in S1).
+        # Truck is larger than sedan — better occlusion and won't block the lane.
         park_wps = ego_wp.next(self._PARK_DIST)
         if park_wps:
-            park_wp   = park_wps[0]
-            right     = park_wp.transform.get_right_vector()
-            # Offset 1.0× right_vector puts sedan on lane edge — close enough
-            # to partially overlap the cyclist in the forward camera view while
-            # still being visually "parked to the side".
-            park_loc  = carla.Location(
-                x=park_wp.transform.location.x - 1.0 * right.x,
-                y=park_wp.transform.location.y - 1.0 * right.y,
+            park_wp  = park_wps[0]
+            right    = park_wp.transform.get_right_vector()
+            park_loc = carla.Location(
+                x=park_wp.transform.location.x - 2.5 * right.x,
+                y=park_wp.transform.location.y - 2.5 * right.y,
                 z=park_wp.transform.location.z + 0.5)
-            sedan_bps = [b for b in bp_lib.filter("vehicle.*")
-                         if b.get_attribute("number_of_wheels").as_int() == 4
-                         and "truck" not in b.id and "bus" not in b.id]
-            sedan_bp  = sedan_bps[0] if sedan_bps else None
-            if sedan_bp:
+            truck_bps = [b for b in bp_lib.filter("vehicle.*")
+                         if "truck" in b.id or "firetruck" in b.id
+                         or "carlacola" in b.id or "sprinter" in b.id]
+            if not truck_bps:
+                truck_bps = [b for b in bp_lib.filter("vehicle.*")
+                             if b.get_attribute("number_of_wheels").as_int() == 4]
+            truck_bp = truck_bps[0] if truck_bps else None
+            if truck_bp:
                 park_t = carla.Transform(park_loc, park_wp.transform.rotation)
-                sedan  = world.try_spawn_actor(sedan_bp, park_t)
-                if sedan:
-                    sedan.set_simulate_physics(False)
-                    sedan.set_autopilot(False)
-                    self._sedan = sedan
-                    self.other_actors.append(sedan)
-                    CarlaDataProvider.register_actor(sedan, park_t)
-                    CarlaDataProvider._carla_actor_pool[sedan.id] = sedan
-                    print(f"[S5] Parked sedan ({sedan_bp.id}) id={sedan.id} "
+                truck  = world.try_spawn_actor(truck_bp, park_t)
+                if truck:
+                    truck.set_simulate_physics(False)
+                    truck.set_autopilot(False)
+                    self._sedan = truck
+                    self.other_actors.append(truck)
+                    CarlaDataProvider.register_actor(truck, park_t)
+                    CarlaDataProvider._carla_actor_pool[truck.id] = truck
+                    print(f"[S5] Parked truck ({truck_bp.id}) id={truck.id} "
                           f"at x={park_loc.x:.1f} y={park_loc.y:.1f}")
                 else:
                     self._sedan = None
-                    print("[S5] WARNING: sedan spawn failed — no occlusion")
+                    print("[S5] WARNING: truck spawn failed — no occlusion")
             else:
                 self._sedan = None
         else:
@@ -1986,9 +2040,9 @@ class S5_HiddenCyclist(AdaptTrustScenario):
 
         seq = py_trees.composites.Sequence("S5_HiddenCyclist")
 
-        # ---- Phase 1: both ego and cyclist approach; trigger at 12 m gap ----
+        # ---- Phase 1: both ego and cyclist approach; trigger at 15 m gap ----
         # WaypointFollower drives cyclist at 8 km/h.
-        # Closure rate 30−8=22 km/h; starting gap 25 m → 12 m gap in ~1.9 s.
+        # Closure rate 30−8=22 km/h; starting gap 40 m → 15 m gap in ~4.1 s.
         phase1 = py_trees.composites.Parallel(
             "S5_Phase1_Approach",
             policy=py_trees.common.ParallelPolicy.SUCCESS_ON_ONE)
@@ -1997,8 +2051,8 @@ class S5_HiddenCyclist(AdaptTrustScenario):
         if bike:
             phase1.add_child(WaypointFollower(bike, 8.0 / 3.6, name="S5_CyclistRide"))
             phase1.add_child(InTriggerDistanceToVehicle(
-                ego, bike, 12.0, name="S5_CyclistClose"))
-        phase1.add_child(TOut(5.0, name="S5_Phase1Timeout"))
+                ego, bike, 15.0, name="S5_CyclistClose"))
+        phase1.add_child(TOut(8.0, name="S5_Phase1Timeout"))
         seq.add_child(phase1)
 
         # ---- Phase 2: emergency brake + keep cyclist at 8 km/h ----
@@ -2034,6 +2088,293 @@ class S5_HiddenCyclist(AdaptTrustScenario):
         return seq
 
 
+class S5v2_HiddenCyclist(AdaptTrustScenario):
+    """
+    Town10HD — spawn[1], heading east (+x).
+
+    Layout:
+      Ego     : spawn[1]  x=-67.3  y=28.0  heading east
+      Truck   : 40 m ahead, 2.5 m right (shoulder) — past the cross-junction,
+                parked static. x≈-27.3  y≈30.6
+      Cyclist : 42 m ahead, 2.5 m right — spawned stationary BESIDE the truck,
+                hidden from ego's forward camera behind truck body. x≈-25.3  y≈30.6
+
+    Phases:
+      Phase 0 (≤4 s): Ego drives east at 30 km/h. Cyclist is stationary beside
+              the truck — not yet visible from the front camera.
+
+      Phase 1 (merge, ~2 s): When ego has driven 20 m (DriveDistance), cyclist
+              starts merging left into ego's lane using a fixed steer=-0.20
+              (empirically: negative steer = -y = left on this eastbound road).
+              Forward throttle keeps cyclist moving at ~5 km/h during merge.
+              Ego continues at 30 km/h.
+
+      Phase 2 (trigger): InTriggerDistanceToVehicle fires when ego-cyclist gap
+              ≤ 18 m. ForceEgoBrake (brake=0.9, 40 ticks ≈ 2 s). Cyclist
+              continues at 8 km/h via WaypointFollower.
+
+      Phase 3a (deviation, ~2 s): Ego applies steer=-0.10 for 30 ticks to nudge
+              left (-y) and clear the cyclist, then straightens for 20 ticks.
+              Cyclist continues at 8 km/h.
+
+      Phase 3b (resume, ≤8 s): BasicAgent resumes at 30 km/h with
+              ignore_vehicles=True (ego is now laterally offset, safe to pass).
+              Cyclist continues at 8 km/h.
+
+    Unexplainability: cyclist was hidden beside the parked truck. When it
+      merged into ego's lane the front camera showed nothing — AV braked before
+      the cyclist was visible.
+
+    Trigger: BRAKING
+    """
+
+    duration       = 22.0
+    target_speed   = 30.0
+    critical_event = "BRAKING"
+
+    _TRUCK_DIST  = 38.0   # m — past cross-junction, clear road
+    _BIKE_DIST   = 46.0   # m — 8 m ahead of truck centre, clear of truck body
+    _SIDE_RIGHT  = 2.5    # m right of lane centre (shoulder)
+
+    def _do_initialize_actors(self, world):
+        bp_lib = world.get_blueprint_library()
+        ego_wp = world.get_map().get_waypoint(self._ego().get_location())
+
+        # ---- Parked truck on shoulder ----
+        truck_wps = ego_wp.next(self._TRUCK_DIST)
+        if truck_wps:
+            twp   = truck_wps[0]
+            right = twp.transform.get_right_vector()
+            tloc  = carla.Location(
+                x=twp.transform.location.x + self._SIDE_RIGHT * right.x,
+                y=twp.transform.location.y + self._SIDE_RIGHT * right.y,
+                z=twp.transform.location.z + 0.5)
+            truck_bps = [b for b in bp_lib.filter("vehicle.*")
+                         if "truck" in b.id or "carlacola" in b.id
+                         or "sprinter" in b.id or "firetruck" in b.id]
+            if not truck_bps:
+                truck_bps = [b for b in bp_lib.filter("vehicle.*")
+                             if b.get_attribute("number_of_wheels").as_int() == 4]
+            truck_bp = truck_bps[0] if truck_bps else None
+            if truck_bp:
+                truck_t = carla.Transform(tloc, twp.transform.rotation)
+                truck   = world.try_spawn_actor(truck_bp, truck_t)
+                if truck:
+                    truck.set_simulate_physics(False)
+                    truck.set_autopilot(False)
+                    self._truck = truck
+                    self.other_actors.append(truck)
+                    CarlaDataProvider.register_actor(truck, truck_t)
+                    CarlaDataProvider._carla_actor_pool[truck.id] = truck
+                    world.tick()
+                    print(f"[S5v2] Truck ({truck_bp.id}) id={truck.id} "
+                          f"x={tloc.x:.1f} y={tloc.y:.1f}")
+                else:
+                    self._truck = None
+                    print("[S5v2] WARNING: truck spawn failed")
+            else:
+                self._truck = None
+        else:
+            self._truck = None
+
+        # ---- Cyclist — spawned stationary beside truck, same lateral offset ----
+        bike_wps = ego_wp.next(self._BIKE_DIST)
+        if bike_wps:
+            bwp   = bike_wps[0]
+            right = bwp.transform.get_right_vector()
+            bloc  = carla.Location(
+                x=bwp.transform.location.x + self._SIDE_RIGHT * right.x,
+                y=bwp.transform.location.y + self._SIDE_RIGHT * right.y,
+                z=bwp.transform.location.z + 0.3)
+            bike_bps = [b for b in bp_lib.filter("vehicle.*")
+                        if any(k in b.id for k in ("crossbike", "omafiets",
+                                                    "diamondback", "century"))]
+            if not bike_bps:
+                bike_bps = [b for b in bp_lib.filter("vehicle.*")
+                            if "bike" in b.id or "bicycle" in b.id]
+            bike_bp = bike_bps[0] if bike_bps else None
+            if bike_bp:
+                bike_t = carla.Transform(bloc, bwp.transform.rotation)
+                bike   = world.try_spawn_actor(bike_bp, bike_t)
+                if bike:
+                    self._bike = bike
+                    self.other_actors.append(bike)
+                    CarlaDataProvider.register_actor(bike, bike_t)
+                    CarlaDataProvider._carla_actor_pool[bike.id] = bike
+                    world.tick()
+                    print(f"[S5v2] Cyclist ({bike_bp.id}) id={bike.id} "
+                          f"x={bloc.x:.1f} y={bloc.y:.1f}")
+                else:
+                    self._bike = None
+                    print("[S5v2] WARNING: cyclist spawn failed")
+            else:
+                self._bike = None
+                print("[S5v2] WARNING: no bicycle blueprint")
+        else:
+            self._bike = None
+
+    def _do_create_behavior(self):
+        from srunner.scenariomanager.timer import TimeOut as TOut
+
+        ego  = self._ego()
+        dest = self._dest(90.0)   # 90 m — stays on same straight, junction at 100 m
+        bike = getattr(self, "_bike", None)
+
+        # ----------------------------------------------------------------
+        # Inline atomic: cyclist merges left into ego lane.
+        # Negative steer = -y direction = LEFT on this eastbound road
+        # (empirically confirmed: positive steer → +y → shoulder/right).
+        # 35 ticks steer + 15 ticks straight at 20 Hz ≈ 2.5 s total.
+        # ----------------------------------------------------------------
+        # ----------------------------------------------------------------
+        # CyclistMerge: partial peek into lane — ~1 m left only.
+        # steer=-0.15 for 20 ticks, then ride straight.
+        # Negative steer = -y = left on this eastbound road.
+        # ----------------------------------------------------------------
+        class CyclistMerge(AtomicBehavior):
+            _STEER       = -0.15
+            _SPEED_MPS   = 6.0 / 3.6
+            _TICKS_STEER = 20
+            _TICKS_STR   = 80   # ride straight afterward
+
+            def __init__(self, actor, name="CyclistMerge"):
+                super().__init__(name, actor)
+                self._count = 0
+
+            def initialise(self):
+                self._count = 0
+
+            def update(self):
+                if not (self._actor and self._actor.is_alive):
+                    return py_trees.common.Status.SUCCESS
+                v   = self._actor.get_velocity()
+                spd = math.sqrt(v.x**2 + v.y**2 + v.z**2)
+                thr = 0.3 if spd < self._SPEED_MPS else 0.0
+                st  = self._STEER if self._count < self._TICKS_STEER else 0.0
+                self._actor.apply_control(
+                    carla.VehicleControl(throttle=thr, steer=st, brake=0.0))
+                self._count += 1
+                total = self._TICKS_STEER + self._TICKS_STR
+                return (py_trees.common.Status.SUCCESS
+                        if self._count >= total
+                        else py_trees.common.Status.RUNNING)
+
+        # ----------------------------------------------------------------
+        # EgoSlowDeviate: soft brake to ~15 km/h + steer left simultaneously.
+        # No full stop. 50 ticks ≈ 2.5 s.
+        # ----------------------------------------------------------------
+        class EgoSlowDeviate(AtomicBehavior):
+            _STEER      = -0.04   # gentle — ~1 m lateral over 30 ticks
+            _TARGET_MPS = 15.0 / 3.6
+            _TICKS      = 30
+
+            def __init__(self, actor, name="EgoSlowDeviate"):
+                super().__init__(name, actor)
+                self._count = 0
+
+            def initialise(self):
+                self._count = 0
+
+            def update(self):
+                if not (self._actor and self._actor.is_alive):
+                    return py_trees.common.Status.SUCCESS
+                v   = self._actor.get_velocity()
+                spd = math.sqrt(v.x**2 + v.y**2 + v.z**2)
+                if spd > self._TARGET_MPS:
+                    ctrl = carla.VehicleControl(throttle=0.0, steer=self._STEER,
+                                                brake=0.4)
+                else:
+                    ctrl = carla.VehicleControl(throttle=0.3, steer=self._STEER,
+                                                brake=0.0)
+                self._actor.apply_control(ctrl)
+                self._count += 1
+                return (py_trees.common.Status.SUCCESS
+                        if self._count >= self._TICKS
+                        else py_trees.common.Status.RUNNING)
+
+        # ----------------------------------------------------------------
+        # EgoResumeStrght: accelerate straight ahead — no routing, no junction.
+        # 60 ticks ≈ 3 s at 30 km/h. Enough to clear cyclist and end scenario.
+        # ----------------------------------------------------------------
+        class EgoResumeStrght(AtomicBehavior):
+            # Drive straight past cyclist then hand off. steer=0 throughout —
+            # the 0.5 m lateral offset from EgoSlowDeviate is imperceptible
+            # and road geometry will naturally re-centre the car.
+            _TARGET_MPS = 30.0 / 3.6
+            _TICKS      = 60
+
+            def __init__(self, actor, name="EgoResumeStrght"):
+                super().__init__(name, actor)
+                self._count = 0
+
+            def initialise(self):
+                self._count = 0
+
+            def update(self):
+                if not (self._actor and self._actor.is_alive):
+                    return py_trees.common.Status.SUCCESS
+                v   = self._actor.get_velocity()
+                spd = math.sqrt(v.x**2 + v.y**2 + v.z**2)
+                thr = 0.6 if spd < self._TARGET_MPS else 0.0
+                self._actor.apply_control(
+                    carla.VehicleControl(throttle=thr, steer=0.0, brake=0.0))
+                self._count += 1
+                return (py_trees.common.Status.SUCCESS
+                        if self._count >= self._TICKS
+                        else py_trees.common.Status.RUNNING)
+
+        seq = py_trees.composites.Sequence("S5v2_HiddenCyclist")
+
+        # Phase 0: ego drives 25 m, cyclist stationary beside truck
+        phase0 = py_trees.composites.Parallel(
+            "S5v2_Phase0_Approach",
+            policy=py_trees.common.ParallelPolicy.SUCCESS_ON_ONE)
+        phase0.add_child(EgoBasicAgentBehavior(ego, dest, self.target_speed,
+                                               ignore_tl=True, name="S5v2_P0_Drive"))
+        phase0.add_child(DriveDistance(ego, 25.0, name="S5v2_P0_Dist"))
+        seq.add_child(phase0)
+
+        # Phase 1: cyclist peeks into lane + ego keeps approaching at 30 km/h.
+        # Trigger on ego DriveDistance(35m total) — by then cyclist has been
+        # merging for ~1 s and is partially in the lane. Using distance-to-vehicle
+        # fired too early because lateral offset counts in the gap calculation.
+        phase1 = py_trees.composites.Parallel(
+            "S5v2_Phase1_Merge",
+            policy=py_trees.common.ParallelPolicy.SUCCESS_ON_ONE)
+        phase1.add_child(EgoBasicAgentBehavior(ego, dest, self.target_speed,
+                                               ignore_tl=True, name="S5v2_P1_Drive"))
+        if bike:
+            phase1.add_child(CyclistMerge(bike, name="S5v2_CyclistMerge"))
+        # Trigger: ego drives another 10 m (35 m total from spawn)
+        phase1.add_child(DriveDistance(ego, 10.0, name="S5v2_P1_Dist"))
+        phase1.add_child(TOut(8.0, name="S5v2_Phase1Timeout"))
+        seq.add_child(phase1)
+
+        # Phase 2: ego slows + steers left — no full stop, just a deviation
+        phase2 = py_trees.composites.Parallel(
+            "S5v2_Phase2_Deviate",
+            policy=py_trees.common.ParallelPolicy.SUCCESS_ON_ONE)
+        phase2.add_child(EgoSlowDeviate(ego, name="S5v2_SlowDeviate"))
+        if bike:
+            phase2.add_child(WaypointFollower(bike, 8.0 / 3.6,
+                                              avoid_collision=False,
+                                              name="S5v2_P2_Cyclist"))
+        seq.add_child(phase2)
+
+        # Phase 3: ego accelerates straight past cyclist — no BasicAgent, no junction
+        phase3 = py_trees.composites.Parallel(
+            "S5v2_Phase3_Resume",
+            policy=py_trees.common.ParallelPolicy.SUCCESS_ON_ONE)
+        phase3.add_child(EgoResumeStrght(ego, name="S5v2_ResumeStrght"))
+        if bike:
+            phase3.add_child(WaypointFollower(bike, 8.0 / 3.6,
+                                              avoid_collision=False,
+                                              name="S5v2_P3_Cyclist"))
+        seq.add_child(phase3)
+
+        return seq
+
+
 # ---------------------------------------------------------------------------
 # Registry — maps scenario_id string → class
 # ---------------------------------------------------------------------------
@@ -2052,6 +2393,7 @@ SCENARIO_REGISTRY = {
     "S2_SuddenStopEvasion":        S2_SuddenStopEvasion,
     "S4_EmergencyVehiclePullOver": S4_EmergencyVehiclePullOver,
     "S5_HiddenCyclist":            S5_HiddenCyclist,
+    "S5v2_HiddenCyclist":          S5v2_HiddenCyclist,
 }
 
 # Map: scenario_id → (map_name, spawn_index)
@@ -2069,4 +2411,5 @@ SCENARIO_MAP = {
     "S2_SuddenStopEvasion":        ("Town04", 10),
     "S4_EmergencyVehiclePullOver": ("Town02", 0),
     "S5_HiddenCyclist":            ("Town02", 0),
+    "S5v2_HiddenCyclist":          ("Town10HD", 1),
 }
