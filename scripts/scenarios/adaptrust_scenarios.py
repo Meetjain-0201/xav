@@ -2297,11 +2297,15 @@ class S5v2_HiddenCyclist(AdaptTrustScenario):
         # 60 ticks ≈ 3 s at 30 km/h. Enough to clear cyclist and end scenario.
         # ----------------------------------------------------------------
         class EgoResumeStrght(AtomicBehavior):
-            # Drive straight past cyclist then hand off. steer=0 throughout —
-            # the 0.5 m lateral offset from EgoSlowDeviate is imperceptible
-            # and road geometry will naturally re-centre the car.
-            _TARGET_MPS = 30.0 / 3.6
-            _TICKS      = 60
+            # Accelerate back to 30 km/h while gently correcting the leftward yaw
+            # that accumulated during EgoSlowDeviate.  steer=+0.015 for the first
+            # 25 ticks (1.25 s, while speed is still low) nudges the car back
+            # toward lane centre without overshooting; steer=0.0 for the
+            # remaining 35 ticks drives straight past the cyclist.
+            _TARGET_MPS   = 30.0 / 3.6
+            _TICKS        = 60
+            _TICKS_CORR   = 25      # ticks of right-correction steer
+            _STEER_CORR   = 0.015   # gentle right steer (positive = +y = right)
 
             def __init__(self, actor, name="EgoResumeStrght"):
                 super().__init__(name, actor)
@@ -2316,8 +2320,9 @@ class S5v2_HiddenCyclist(AdaptTrustScenario):
                 v   = self._actor.get_velocity()
                 spd = math.sqrt(v.x**2 + v.y**2 + v.z**2)
                 thr = 0.6 if spd < self._TARGET_MPS else 0.0
+                st  = self._STEER_CORR if self._count < self._TICKS_CORR else 0.0
                 self._actor.apply_control(
-                    carla.VehicleControl(throttle=thr, steer=0.0, brake=0.0))
+                    carla.VehicleControl(throttle=thr, steer=st, brake=0.0))
                 self._count += 1
                 return (py_trees.common.Status.SUCCESS
                         if self._count >= self._TICKS
