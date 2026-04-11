@@ -83,7 +83,7 @@ COLOR_DIM_IDLE = (120, 120, 120)   # grey for idle subtitle text
 # Output codec
 FOURCC = cv2.VideoWriter_fourcc(*"mp4v")
 
-CONDITIONS = ["none", "template", "descriptive", "teleological"]
+CONDITIONS = ["none", "descriptive", "teleological"]
 
 # Safety-relevant classes shown in the HUD top bar.
 # Cars, trucks, buses, motorcycles are omitted — normal traffic, not notable.

@@ -443,6 +443,14 @@ class AdaptTrustRunner:
             print("[runner] Rendering overlay videos …")
             render_overlays(self.output_dir)
 
+            # Add engine noise + TTS voiceover to overlay videos
+            print("[runner] Adding audio to overlay videos …")
+            try:
+                from scripts.audio_pipeline.synthesizer import add_audio_to_videos
+                add_audio_to_videos(self.output_dir)
+            except Exception as _audio_exc:
+                print(f"[runner] WARNING: audio pipeline failed ({_audio_exc}) — videos have no audio")
+
         except Exception as exc:
             result["status"] = f"error: {exc}"
             raise

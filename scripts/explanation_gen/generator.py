@@ -45,19 +45,23 @@ _DATA_ROOT = _REPO_ROOT / "data"
 # ---------------------------------------------------------------------------
 
 _DESCRIPTIVE_PROMPT = """\
-You are an autonomous vehicle assistant. Look at this driving scene.
+You are an autonomous vehicle assistant. Look at these frames — an action is about to happen.
 Vehicle data: Speed={speed} km/h, Brake={brake}, Throttle={throttle}, Steer={steer}
 Detected objects: {yolo_objects}
 Traffic light: {traffic_light_state}
-Describe what the vehicle is doing in 1-2 factual sentences."""
+Nearest participant: {nearest_npc}
+In exactly 1 short sentence, describe what the vehicle is about to do and why. \
+Use anticipatory language (e.g. "is slowing down", "is preparing to stop", "is moving to the side")."""
 
 _TELEOLOGICAL_PROMPT = """\
-You are an autonomous vehicle explaining actions to your passenger. Speak in first person.
+You are an autonomous vehicle speaking directly to your passenger. Look at these frames — you are about to take an action.
 Vehicle data: Speed={speed} km/h, Brake={brake}, Throttle={throttle}, Steer={steer}
 Detected objects: {yolo_objects}
 Traffic light: {traffic_light_state}
-Explain what you are doing and WHY in 1-2 sentences. Focus on intention and goal.
-Style: 'I'm slowing down to give the pedestrian ahead safe space to cross.'"""
+Nearest participant: {nearest_npc}
+In exactly 1 short sentence, tell the passenger what you are about to do and why. \
+Use first person anticipatory language (e.g. "I'm slowing down to...", "I'm pulling over because..."). \
+Example: 'I'm slowing down to give the pedestrian ahead safe space to cross.'"""
 
 # ---------------------------------------------------------------------------
 # Template rules (no API — trigger_type → human-readable string)
@@ -184,7 +188,12 @@ def _encode_image(image_path: Path) -> str:
         return base64.b64encode(f.read()).decode("utf-8")
 
 
-def _build_context(snap: dict, yolo_detections: list[dict], timestamp: float) -> dict:
+def _build_context(
+    snap: dict,
+    yolo_detections: list[dict],
+    timestamp: float,
+    npc_telemetry: list[list[dict]] | None = None,
+) -> dict:
     """
     Extract human-readable context fields for prompt formatting.
 
@@ -192,8 +201,10 @@ def _build_context(snap: dict, yolo_detections: list[dict], timestamp: float) ->
         snap:            Telemetry snapshot from the action event.
         yolo_detections: Full yolo_detections.json list (all frames).
         timestamp:       Event timestamp (sim seconds).
+        npc_telemetry:   Optional list-of-frames from npc_telemetry.json.
 
-    Returns dict with keys: speed, brake, throttle, steer, yolo_objects, traffic_light_state.
+    Returns dict with keys: speed, brake, throttle, steer, yolo_objects,
+                            traffic_light_state, nearest_npc.
     """
     # Find YOLO detections within ±0.5 s of the trigger frame
     nearby = [
@@ -216,7 +227,39 @@ def _build_context(snap: dict, yolo_detections: list[dict], timestamp: float) ->
     else:
         yolo_str = "none detected"
 
-    tl_state = "detected" if "traffic light" in seen else "not detected"
+    # Traffic light state: infer from YOLO visibility + vehicle behaviour
+    if "traffic light" in seen:
+        brake = snap.get("brake", 0.0)
+        tl_state = "red" if brake > 0.2 else "green"
+    else:
+        tl_state = "none visible"
+
+    # Nearest NPC from npc_telemetry.json (list-of-frames format)
+    nearest_npc = "none"
+    if npc_telemetry:
+        ego_x = snap.get("x", 0.0)
+        ego_y = snap.get("y", 0.0)
+        # Find frame closest in time to the trigger
+        closest_frame = min(
+            npc_telemetry,
+            key=lambda frame: abs((frame[0].get("timestamp", 0) if frame else 0) - timestamp),
+            default=None,
+        )
+        if closest_frame:
+            best_npc = min(
+                closest_frame,
+                key=lambda n: (n.get("x", ego_x) - ego_x) ** 2 + (n.get("y", ego_y) - ego_y) ** 2,
+                default=None,
+            )
+            if best_npc:
+                dx = best_npc.get("x", ego_x) - ego_x
+                dy = best_npc.get("y", ego_y) - ego_y
+                dist = (dx ** 2 + dy ** 2) ** 0.5
+                npc_speed = best_npc.get("speed_kmh", 0.0)
+                actor_type = best_npc.get("actor_type", "vehicle")
+                # Simplify actor_type: "vehicle.audi.a2" → "vehicle"
+                kind = actor_type.split(".")[0] if "." in actor_type else actor_type
+                nearest_npc = f"{kind} at {dist:.1f} m moving {npc_speed:.1f} km/h"
 
     return {
         "speed":               round(snap.get("speed_kmh", 0), 1),
@@ -225,17 +268,42 @@ def _build_context(snap: dict, yolo_detections: list[dict], timestamp: float) ->
         "steer":               round(snap.get("steer", 0), 2),
         "yolo_objects":        yolo_str,
         "traffic_light_state": tl_state,
+        "nearest_npc":         nearest_npc,
     }
+
+
+def _collect_trigger_frames(trigger_frames_dir: Path, trigger_type: str, step: int = 4) -> list[Path]:
+    """
+    Return every `step`-th frame from trigger_frames/ matching the event's trigger type.
+
+    Files are named like: t_2093.847_BRAKING.jpg
+    Sorted by their timestamp prefix so frames are in chronological order.
+    The last frame (the actual trigger moment) is always included.
+    """
+    if not trigger_frames_dir.exists():
+        return []
+    frames = sorted(
+        trigger_frames_dir.glob(f"*_{trigger_type}.jpg"),
+        key=lambda p: float(p.stem.split("_")[1]),
+    )
+    if not frames:
+        return []
+    # Take every step-th frame; always append the last frame if not already included
+    sampled = frames[::step]
+    if frames[-1] not in sampled:
+        sampled.append(frames[-1])
+    return sampled
 
 
 def _call_gpt4o(
     client,
     prompt_template: str,
     context: dict,
-    image_path: Path | None,
+    image_paths: list[Path],
 ) -> str:
     """
     Make one GPT-4o API call with rate limiting and 429 retry.
+    Sends up to len(image_paths) frames (all at detail=low) plus the text prompt.
 
     Returns the explanation string, or _PLACEHOLDER on any unrecoverable error.
     """
@@ -244,23 +312,22 @@ def _call_gpt4o(
     prompt = prompt_template.format(**context)
     messages: list[dict] = []
 
-    if image_path and image_path.exists():
-        b64 = _encode_image(image_path)
-        messages.append({
-            "role": "user",
-            "content": [
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:image/jpeg;base64,{b64}",
-                        "detail": "low",   # ~$0.00085/image vs $0.00340 for high
-                    },
+    valid_images = [p for p in image_paths if p.exists()]
+    if valid_images:
+        content: list[dict] = []
+        for img in valid_images:
+            content.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/jpeg;base64,{_encode_image(img)}",
+                    "detail": "low",   # ~$0.00085/image
                 },
-                {"type": "text", "text": prompt},
-            ],
-        })
+            })
+        content.append({"type": "text", "text": prompt})
+        messages.append({"role": "user", "content": content})
+        logger.debug("  Sending %d frame(s) to GPT-4o", len(valid_images))
     else:
-        logger.warning("Trigger frame not found at %s — sending text-only prompt.", image_path)
+        logger.warning("No trigger frames found — sending text-only prompt.")
         messages.append({"role": "user", "content": prompt})
 
     for attempt in range(1, _MAX_RETRIES + 1):
@@ -342,9 +409,10 @@ def generate_all_explanations(scenario_dir: str | Path) -> dict[str, Path]:
     if not scenario_dir.is_absolute():
         scenario_dir = _REPO_ROOT / scenario_dir
 
-    events_path = scenario_dir / "action_events.json"
-    yolo_path   = scenario_dir / "yolo_detections.json"
-    exp_dir     = scenario_dir / "explanations"
+    events_path   = scenario_dir / "action_events.json"
+    yolo_path     = scenario_dir / "yolo_detections.json"
+    npc_path      = scenario_dir / "npc_telemetry.json"
+    exp_dir       = scenario_dir / "explanations"
 
     if not events_path.exists():
         raise FileNotFoundError(f"action_events.json not found in {scenario_dir}")
@@ -360,6 +428,12 @@ def generate_all_explanations(scenario_dir: str | Path) -> dict[str, Path]:
         json.loads(yolo_path.read_text()) if yolo_path.exists() else []
     )
 
+    npc_telemetry: list[list[dict]] | None = (
+        json.loads(npc_path.read_text()) if npc_path.exists() else None
+    )
+    if npc_telemetry:
+        logger.info("  Loaded NPC telemetry (%d frames)", len(npc_telemetry))
+
     logger.info(
         "Generating explanations for %d events in %s",
         len(events), scenario_dir.name,
@@ -371,28 +445,7 @@ def generate_all_explanations(scenario_dir: str | Path) -> dict[str, Path]:
     none_entries = [_make_entry(ev, "") for ev in events]
 
     # ------------------------------------------------------------------
-    # Condition 2 — Template (always succeeds)
-    # ------------------------------------------------------------------
-    def _nearby_classes(ts: float) -> list[str]:
-        return [
-            d["class_name"] for d in yolo_detections
-            if abs(d.get("timestamp", 0) - ts) <= 0.5
-        ]
-
-    template_entries = [
-        _make_entry(
-            ev,
-            _template_explanation(
-                ev["trigger_type"],
-                ev["telemetry_snapshot"],
-                _nearby_classes(ev["timestamp"]),
-            ),
-        )
-        for ev in events
-    ]
-
-    # ------------------------------------------------------------------
-    # Conditions 3 & 4 — GPT-4o (descriptive + teleological)
+    # Conditions 2 & 3 — GPT-4o (descriptive + teleological)
     # ------------------------------------------------------------------
     client = _get_openai_client()
     gpt_available = client is not None
@@ -411,23 +464,20 @@ def generate_all_explanations(scenario_dir: str | Path) -> dict[str, Path]:
         snap      = ev["telemetry_snapshot"]
         trigger   = ev["trigger_type"]
         ts        = ev["timestamp"]
-        ctx       = _build_context(snap, yolo_detections, ts)
+        ctx       = _build_context(snap, yolo_detections, ts, npc_telemetry)
 
-        # Resolve trigger frame path (stored relative to data/)
-        raw_frame_path = ev.get("frame_path")
-        image_path: Path | None = None
-        if raw_frame_path:
-            candidate = _DATA_ROOT / raw_frame_path
-            image_path = candidate if candidate.exists() else None
-            if not candidate.exists():
-                logger.warning("Trigger frame not found: %s", candidate)
-
-        logger.info("  Event %d: %s @ t=%.2fs", ev["event_index"], trigger, ts)
+        # Collect every 4th trigger frame for this event (plus the final trigger frame)
+        trigger_frames_dir = scenario_dir / "trigger_frames"
+        image_paths = _collect_trigger_frames(trigger_frames_dir, trigger, step=4)
+        logger.info(
+            "  Event %d: %s @ t=%.2fs — %d frame(s)",
+            ev["event_index"], trigger, ts, len(image_paths),
+        )
 
         if gpt_available and not gpt_skipped:
             try:
-                desc = _call_gpt4o(client, _DESCRIPTIVE_PROMPT, ctx, image_path)
-                tele = _call_gpt4o(client, _TELEOLOGICAL_PROMPT, ctx, image_path)
+                desc = _call_gpt4o(client, _DESCRIPTIVE_PROMPT, ctx, image_paths)
+                tele = _call_gpt4o(client, _TELEOLOGICAL_PROMPT, ctx, image_paths)
             except _SkipGPT as e:
                 logger.warning("GPT-4o disabled for remainder of run: %s", e)
                 gpt_skipped = True
@@ -446,7 +496,6 @@ def generate_all_explanations(scenario_dir: str | Path) -> dict[str, Path]:
     outputs: dict[str, Path] = {}
     for name, entries in [
         ("none",         none_entries),
-        ("template",     template_entries),
         ("descriptive",  descriptive_entries),
         ("teleological", teleological_entries),
     ]:
