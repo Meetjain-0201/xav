@@ -2,7 +2,7 @@ import type { Metadata } from 'next'
 import './globals.css'
 
 export const metadata: Metadata = {
-  title: 'AdaptTrust — Live Results',
+  title: 'xav: Live Results',
   description: 'HCI Research Dashboard: Autonomous Vehicle Trust Study',
 }
 

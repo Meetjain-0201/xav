@@ -25,7 +25,7 @@ export interface ScenarioResponseData {
   jian_order?: number[]
   jian_composite?: number       // all 12 combined
   jian_trust_mean?: number      // items 6–12 (positive factor)
-  jian_distrust_mean?: number   // items 1–5 reversed (negative factor)
+  jian_distrust_mean?: number | null  // items 1–5 reversed (negative factor)
 
   // Gyevnar trust calibration item (1-7, all conditions)
   trust_calibration_item?: number

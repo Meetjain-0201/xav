@@ -26,7 +26,7 @@ function CustomTooltip({ active, payload, label }: any) {
           <span className="inline-block w-2.5 h-2.5 rounded-sm" style={{ background: p.color }} />
           <span className="text-slate-600">{CONDITION_LABELS[p.name] ?? p.name}</span>
           <span className="font-mono font-semibold text-slate-900 ml-auto pl-3">
-            {isNaN(p.value) ? '—' : p.value.toFixed(2)}
+            {isNaN(p.value) ? '-' : p.value.toFixed(2)}
           </span>
         </div>
       ))}

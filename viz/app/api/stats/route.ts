@@ -29,22 +29,31 @@ type ScenarioRow = {
 }
 
 type ResponseRow = {
-  participant_id: string
-  completed: boolean
-  overall_trust: number | null
+  participant_id:       string
+  completed:            boolean
+  overall_trust:        number | null
+  expl_preference_open: string | null
+  debrief_open:         string | null
 }
 
 export async function GET() {
   try {
     const supabase = createClient(supabaseUrl, supabaseServiceKey)
 
-    const [scenarioResult, responseResult] = await Promise.all([
+    const [scenarioResult, responseResult, qualScenarioResult] = await Promise.all([
       supabase
         .from('scenario_responses')
         .select(
           'participant_id,scenario_index,condition,criticality,jian_composite,cognitive_load,comp_score,transp_mean,expl_clear,expl_helpful,expl_influenced,intent_mean'
         ),
-      supabase.from('responses').select('participant_id,completed,overall_trust'),
+      supabase.from('responses').select('participant_id,completed,overall_trust,expl_preference_open,debrief_open'),
+      supabase
+        .from('scenario_responses')
+        .select('scenario_id,condition,mental_model_text')
+        .not('mental_model_text', 'is', null)
+        .neq('mental_model_text', '')
+        .order('created_at', { ascending: false })
+        .limit(50),
     ])
 
     if (scenarioResult.error) {
@@ -56,6 +65,8 @@ export async function GET() {
 
     const scenarios: ScenarioRow[] = scenarioResult.data ?? []
     const responses: ResponseRow[] = responseResult.data ?? []
+
+    const qualRows = qualScenarioResult.data ?? []
 
     // --- Summary ---
     const total     = responses.length
@@ -137,6 +148,21 @@ export async function GET() {
       count: completedResponses.length,
     }
 
+    // --- Qualitative responses ---
+    const mentalModels = qualRows.map((r: { scenario_id: string; condition: string; mental_model_text: string }) => ({
+      scenario_id: r.scenario_id,
+      condition:   r.condition,
+      text:        r.mental_model_text,
+    }))
+
+    const openResponses = responses
+      .filter((r) => r.expl_preference_open || r.debrief_open)
+      .map((r) => ({
+        participant_id:       r.participant_id,
+        expl_preference_open: r.expl_preference_open,
+        debrief_open:         r.debrief_open,
+      }))
+
     return NextResponse.json(
       {
         summary: { total, completed, byCondition },
@@ -148,6 +174,7 @@ export async function GET() {
         explanation,
         intentionality,
         overallTrust,
+        qualitative: { mentalModels, openResponses },
       },
       { headers: { 'Cache-Control': 'no-store' } }
     )

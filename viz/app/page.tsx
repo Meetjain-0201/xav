@@ -11,6 +11,7 @@ const ComprehensionBar   = dynamic(() => import('@/components/charts/Comprehensi
 const StiasBar           = dynamic(() => import('@/components/charts/StiasBar'),           { ssr: false, loading: () => <SkeletonChart height={260} /> })
 const ExplanationBar     = dynamic(() => import('@/components/charts/ExplanationBar'),     { ssr: false, loading: () => <SkeletonChart height={260} /> })
 const AnthroBar          = dynamic(() => import('@/components/charts/AnthroBar'),          { ssr: false, loading: () => <SkeletonChart height={260} /> })
+const QualitativeFeed    = dynamic(() => import('@/components/charts/QualitativeFeed'),    { ssr: false, loading: () => <SkeletonChart height={260} /> })
 
 interface Summary           { total: number; completed: number; byCondition: Record<string, number> }
 interface TrustByCritEntry  { condition: string; criticality: string; mean: number; count: number }
@@ -21,6 +22,9 @@ interface TransparencyEntry { condition: string; mean: number }
 interface ExplEntry         { condition: string; clear: number; helpful: number; influenced: number }
 interface IntentEntry       { condition: string; mean: number }
 interface OverallTrust      { mean: number; count: number }
+interface MentalModel       { scenario_id: string; condition: string; text: string }
+interface OpenResponse      { participant_id: string; expl_preference_open: string | null; debrief_open: string | null }
+interface Qualitative       { mentalModels: MentalModel[]; openResponses: OpenResponse[] }
 
 interface StatsData {
   summary:                     Summary
@@ -32,6 +36,7 @@ interface StatsData {
   explanation:                 ExplEntry[]
   intentionality:              IntentEntry[]
   overallTrust:                OverallTrust
+  qualitative:                 Qualitative
 }
 
 const CONDITION_COLORS: Record<string, string> = {
@@ -49,7 +54,7 @@ const CONDITION_LABELS: Record<string, string> = {
 const CONDITIONS = ['none', 'vlm_descriptive', 'vlm_teleological']
 
 function fmt(v: number | undefined | null, decimals = 2): string {
-  if (v === undefined || v === null || isNaN(v)) return '—'
+  if (v === undefined || v === null || isNaN(v)) return '-'
   return v.toFixed(decimals)
 }
 
@@ -128,7 +133,7 @@ function SummaryTable({ data }: { data: StatsData }) {
                 <td className="text-right py-2 px-2 font-mono text-slate-800 font-semibold">{fmt(getJian(cond))}</td>
                 <td className="text-right py-2 px-2 font-mono text-slate-600">{fmt(getCogLoad(cond), 1)}</td>
                 <td className="text-right py-2 px-2 font-mono text-slate-600">
-                  {compVal == null || isNaN(compVal) ? '—' : `${compVal.toFixed(1)}%`}
+                  {compVal == null || isNaN(compVal) ? '-' : `${compVal.toFixed(1)}%`}
                 </td>
                 <td className="text-right py-2 px-2 font-mono text-slate-600">{fmt(getTransp(cond))}</td>
                 <td className="text-right py-2 pl-2 font-mono text-slate-600">{fmt(getIntent(cond))}</td>
@@ -178,8 +183,8 @@ export default function DashboardPage() {
         <div className="max-w-screen-xl mx-auto px-6 py-4 flex items-center gap-5">
           <div className="flex-shrink-0"><RadarIcon /></div>
           <div className="flex-1 min-w-0">
-            <h1 className="text-xl font-bold text-white leading-tight tracking-tight">AdaptTrust — Live Results</h1>
-            <p className="text-slate-400 text-xs mt-0.5">HCI Study: Autonomous Vehicle Explanation Trust</p>
+            <h1 className="text-xl font-bold text-white leading-tight tracking-tight">xav</h1>
+            <p className="text-slate-400 text-xs mt-0.5">Explainability in Autonomous Vehicles - Live Results</p>
           </div>
           <div className="hidden sm:flex items-center gap-4 text-xs">
             {lastUpdated && <span className="text-slate-400">Updated <span className="text-slate-300 font-mono">{formatTime(lastUpdated)}</span></span>}
@@ -218,10 +223,6 @@ export default function DashboardPage() {
               {CONDITION_LABELS[cond]}
             </span>
           ))}
-          <span className="inline-flex items-center gap-1 ml-2 text-xs text-slate-400">Criticality:</span>
-          {[{ label: 'HIGH', color: '#ef4444' }, { label: 'MEDIUM', color: '#f59e0b' }, { label: 'LOW', color: '#22c55e' }].map(({ label, color }) => (
-            <span key={label} className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium text-white" style={{ background: color }}>{label}</span>
-          ))}
         </div>
 
         {loading && !data ? (
@@ -253,7 +254,7 @@ export default function DashboardPage() {
               <ChartCard title="Comprehension Accuracy by Condition" subtitle="Average % of comprehension questions answered correctly (0–100%)">
                 <ComprehensionBar data={data.comprehension} />
               </ChartCard>
-              <ChartCard title="Perceived Transparency by Condition" subtitle="Mean transparency rating (1–7) — understanding, predictability, clarity">
+              <ChartCard title="Perceived Transparency by Condition" subtitle="Mean transparency rating (1–7) - understanding, predictability, clarity">
                 <StiasBar data={data.transparency} />
               </ChartCard>
             </>
@@ -263,7 +264,7 @@ export default function DashboardPage() {
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           {loading && !data ? (<><SkeletonCard /><SkeletonCard /></>) : data ? (
             <>
-              <ChartCard title="Explanation Helpfulness" subtitle="Clarity, helpfulness, and influence ratings (1–7) — vlm conditions only">
+              <ChartCard title="Explanation Helpfulness" subtitle="Clarity, helpfulness, and influence ratings (1–7) - vlm conditions only">
                 {data.explanation.length > 0
                   ? <ExplanationBar data={data.explanation} />
                   : <div className="flex items-center justify-center h-40 text-slate-400 text-sm">No explanation data yet</div>}
@@ -286,12 +287,26 @@ export default function DashboardPage() {
                   </div>
                 </div>
               </ChartCard>
-              <ChartCard title="Summary — All Means" subtitle="Aggregated measure means by condition">
+              <ChartCard title="Summary - All Means" subtitle="Aggregated measure means by condition">
                 <SummaryTable data={data} />
               </ChartCard>
             </>
           ) : null}
         </div>
+
+        {loading && !data ? (
+          <SkeletonCard />
+        ) : data?.qualitative ? (
+          <ChartCard
+            title="Participant Responses"
+            subtitle="Mental model explanations and open-ended reflections (most recent 50)"
+          >
+            <QualitativeFeed
+              mentalModels={data.qualitative.mentalModels}
+              openResponses={data.qualitative.openResponses}
+            />
+          </ChartCard>
+        ) : null}
 
         <footer className="text-center text-xs text-slate-400 pb-6">
           AdaptTrust Dashboard · Auto-refreshes every 60 seconds ·{' '}
