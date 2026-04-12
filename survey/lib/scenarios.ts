@@ -99,9 +99,9 @@ export const SCENARIOS: ScenarioConfig[] = [
     label: 'Highway Sudden Stop',
     criticality: 'HIGH',
     video_ids: {
-      none:             'PLACEHOLDER_S2_NONE',
-      vlm_descriptive:  'PLACEHOLDER_S2_DESCRIPTIVE',
-      vlm_teleological: 'PLACEHOLDER_S2_TELEOLOGICAL',
+      none:             '6Ztz9cj6GrE',
+      vlm_descriptive:  'x5cS76iKr6k',
+      vlm_teleological: '5Iug6CYUrfY',
     },
     comprehension: [
       {
@@ -146,9 +146,9 @@ export const SCENARIOS: ScenarioConfig[] = [
     label: 'Emergency Vehicle Yield',
     criticality: 'MEDIUM',
     video_ids: {
-      none:             'PLACEHOLDER_S4_NONE',
-      vlm_descriptive:  'PLACEHOLDER_S4_DESCRIPTIVE',
-      vlm_teleological: 'PLACEHOLDER_S4_TELEOLOGICAL',
+      none:             'KMg7Sa7KDzw',
+      vlm_descriptive:  'x4bwhAsgJkM',
+      vlm_teleological: 'h-zsE_lMNho',
     },
     comprehension: [
       {
@@ -240,9 +240,9 @@ export const SCENARIOS: ScenarioConfig[] = [
     label: 'Narrow Street Navigation',
     criticality: 'LOW',
     video_ids: {
-      none:             'PLACEHOLDER_L3_NONE',
-      vlm_descriptive:  'PLACEHOLDER_L3_DESCRIPTIVE',
-      vlm_teleological: 'PLACEHOLDER_L3_TELEOLOGICAL',
+      none:             'J8HOVsRLMIM',
+      vlm_descriptive:  'KJQUgxIXwQg',
+      vlm_teleological: 'rdU9h5U2QHM',
     },
     comprehension: [
       {
