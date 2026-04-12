@@ -1,9 +1,10 @@
 'use client'
+import { useRouter } from 'next/navigation'
 
 interface ScenarioInfo {
-  current: number   // 1-indexed scenario number
-  total: number     // total scenarios
-  stepNum: number   // step within scenario (1-indexed)
+  current: number
+  total: number
+  stepNum: number
   totalSteps: number
 }
 
@@ -12,6 +13,7 @@ interface PageWrapperProps {
   step?: number
   totalSteps?: number
   scenarioInfo?: ScenarioInfo
+  wide?: boolean
   children: React.ReactNode
 }
 
@@ -20,8 +22,11 @@ export default function PageWrapper({
   step,
   totalSteps,
   scenarioInfo,
+  wide = false,
   children,
 }: PageWrapperProps) {
+  const router = useRouter()
+
   const pct = step && totalSteps
     ? Math.round((step / totalSteps) * 100)
     : scenarioInfo
@@ -36,10 +41,19 @@ export default function PageWrapper({
 
   return (
     <div className="min-h-screen bg-gray-50 py-8 px-4">
-      <div className="max-w-3xl mx-auto space-y-4">
+      <div className={`${wide ? 'max-w-5xl' : 'max-w-3xl'} mx-auto space-y-4`}>
+
         {/* Header */}
         <div className="flex items-center justify-between text-xs text-gray-400">
-          <span>Northeastern University · CS 6170</span>
+          <div className="flex items-center gap-3">
+            <button
+              onClick={() => router.back()}
+              className="hover:text-gray-600 transition-colors"
+            >
+              ← Back
+            </button>
+            <span>Northeastern University · CS 6170</span>
+          </div>
           {stepLabel && <span>{stepLabel}</span>}
         </div>
 

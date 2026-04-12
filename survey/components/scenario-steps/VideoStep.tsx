@@ -3,7 +3,7 @@ import { useState, useEffect, useRef } from 'react'
 import { useRouter } from 'next/navigation'
 import { useForm } from 'react-hook-form'
 import { getSurvey, setScenarioData } from '@/lib/survey-store'
-import { getScenarioForIndex } from '@/lib/scenarios'
+import { getScenarioForIndex, getConditionForScenario } from '@/lib/scenarios'
 import { nextScenarioPath, scenarioStepNumber, TOTAL_SCENARIO_STEPS, TOTAL_SCENARIOS } from '@/lib/scenario-nav'
 import PageWrapper from '@/components/survey/PageWrapper'
 
@@ -21,7 +21,7 @@ export default function VideoStep({ scenarioIndex }: { scenarioIndex: number }) 
   const survey = getSurvey()
   const scenarioOrder = survey.scenario_order ?? [0, 1, 2, 3, 4]
   const scenario = getScenarioForIndex(scenarioOrder, scenarioIndex)
-  const condition = (survey.condition ?? 'vlm_descriptive') as any
+  const condition = getConditionForScenario(survey.group_number ?? 0, scenarioIndex)
   const videoId = scenario.video_ids[condition]
   const isPlaceholder = videoId.startsWith('PLACEHOLDER')
 
@@ -84,6 +84,7 @@ export default function VideoStep({ scenarioIndex }: { scenarioIndex: number }) 
         stepNum: scenarioStepNumber('video'),
         totalSteps: TOTAL_SCENARIO_STEPS,
       }}
+      wide
     >
       <p className="text-sm text-gray-500 mb-4">
         Watch the full clip carefully. The Continue button will appear when the video finishes.

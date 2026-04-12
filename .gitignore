@@ -5,6 +5,8 @@
 data/scenarios/
 data/explanations/
 
+viz/node_modules
+
 # ML model weights (downloaded automatically by ultralytics)
 *.pt
 *.pth

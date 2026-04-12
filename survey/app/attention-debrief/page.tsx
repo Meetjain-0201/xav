@@ -1,15 +1,23 @@
 'use client'
+import { useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { useForm } from 'react-hook-form'
 import { getSurvey, setSurvey } from '@/lib/survey-store'
 import PageWrapper from '@/components/survey/PageWrapper'
 
-const AC2_OPTIONS = ['Not at all', 'Slightly', 'Moderately', 'Very', 'Extremely']
-const AC2_CORRECT = 'Extremely'
+const AC2_OPTIONS = ['Blue', 'Green', 'Orange', 'Purple']
+const AC2_CORRECT = 'Orange'
+
+const MANIP_OPTIONS = [
+  { value: 'yes',      label: 'Yes, some clips included a verbal explanation' },
+  { value: 'no',       label: 'No, none of the clips included an explanation' },
+  { value: 'not_sure', label: "I'm not sure" },
+]
 
 export default function AttentionDebriefPage() {
   const router = useRouter()
-  const { register, handleSubmit } = useForm()
+  const { register, handleSubmit, watch } = useForm()
+  const manipValue = watch('manip_check_global')
 
   async function onSubmit(data: any) {
     const ac2 = data.ac2 ?? ''
@@ -17,7 +25,9 @@ export default function AttentionDebriefPage() {
     const payload = {
       ac2,
       attn_fail_2,
-      debrief_open: data.debrief_open || '',
+      manip_check_global:   data.manip_check_global ?? '',
+      expl_preference_open: data.expl_preference_open ?? '',
+      debrief_open:         data.debrief_open ?? '',
     }
     setSurvey(payload)
     await fetch('/api/response', {
@@ -32,16 +42,10 @@ export default function AttentionDebriefPage() {
     <PageWrapper title="Final Questions" step={9} totalSteps={10}>
       <form onSubmit={handleSubmit(onSubmit)} className="space-y-8">
 
-        {/* Attention Check 2 — trap question */}
-        <div className="bg-amber-50 border border-amber-200 rounded-lg p-5">
-          <p className="text-sm font-medium text-amber-900 mb-1">Attention Check</p>
-          <p className="text-sm text-amber-800 mb-4">
-            To confirm you are still reading carefully, please select{' '}
-            <strong>"Extremely"</strong> for the item below.
-          </p>
-          <p className="text-sm font-medium text-gray-800 mb-3">
-            "I have been paying careful attention throughout this study."
-          </p>
+        {/* AC2 — Color block */}
+        <div>
+          <div className="w-14 h-14 rounded-lg bg-orange-500 mb-4" />
+          <p className="section-title mb-3">What color is the box above?</p>
           <div className="space-y-2">
             {AC2_OPTIONS.map((opt) => (
               <label key={opt} className="radio-row">
@@ -52,16 +56,48 @@ export default function AttentionDebriefPage() {
           </div>
         </div>
 
-        {/* Open-ended debrief */}
+        {/* Manipulation Check */}
+        <div>
+          <p className="section-title mb-3">
+            Did any of the video clips include a verbal explanation of the vehicle's actions?
+          </p>
+          <div className="space-y-2">
+            {MANIP_OPTIONS.map(({ value, label }) => (
+              <label key={value} className="radio-row">
+                <input type="radio" value={value} {...register('manip_check_global')} className="w-4 h-4 text-blue-600" />
+                <span className="text-sm text-gray-700">{label}</span>
+              </label>
+            ))}
+          </div>
+        </div>
+
+        {/* Explanation Preference — only shown if participant noticed explanations */}
+        {manipValue === 'yes' && (
+          <div>
+            <label className="section-title block mb-1">
+              Which format of explanation, if any, did you find most helpful?
+            </label>
+            <p className="text-xs text-gray-400 mb-2">Optional.</p>
+            <textarea
+              {...register('expl_preference_open')}
+              rows={3}
+              placeholder="Optional: describe what you found helpful or not helpful..."
+              className="w-full rounded-lg border border-gray-300 px-3 py-2.5 text-sm
+                         focus:outline-none focus:ring-2 focus:ring-blue-500 resize-y"
+            />
+          </div>
+        )}
+
+        {/* Global Reflection */}
         <div>
           <label className="section-title block mb-1">
-            Did any information shown during the video clips change how you felt about the vehicle's decisions?
+            Looking across all 5 clips, which situation did you understand best, and what helped you understand it?
           </label>
-          <p className="text-xs text-gray-400 mb-2">Optional. Please explain your reasoning.</p>
+          <p className="text-xs text-gray-400 mb-2">Optional.</p>
           <textarea
             {...register('debrief_open')}
-            rows={5}
-            placeholder="Optional response…"
+            rows={4}
+            placeholder="Optional response..."
             className="w-full rounded-lg border border-gray-300 px-3 py-2.5 text-sm
                        focus:outline-none focus:ring-2 focus:ring-blue-500 resize-y"
           />

@@ -2,7 +2,7 @@
 import { useRouter } from 'next/navigation'
 import { v4 as uuidv4 } from 'uuid'
 import { setSurvey } from '@/lib/survey-store'
-import { CONDITIONS, shuffleIndices, SCENARIOS } from '@/lib/scenarios'
+import { shuffleIndices, SCENARIOS } from '@/lib/scenarios'
 import Image from 'next/image'
 
 const SECTIONS = [
@@ -12,7 +12,7 @@ const SECTIONS = [
   },
   {
     label: 'Procedures',
-    text: 'You will watch 5 short simulated driving clips showing an autonomous vehicle in different situations, and answer questions after each clip. The study takes approximately 20–25 minutes.',
+    text: 'You will watch 5 short simulated driving clips showing an autonomous vehicle in different situations, and answer questions after each clip. The study takes approximately 35–45 minutes.',
   },
   {
     label: 'Risks',
@@ -35,17 +35,22 @@ const SECTIONS = [
 export default function ConsentPage() {
   const router = useRouter()
 
-  function handleAgree() {
+  async function handleAgree() {
     const participant_id = uuidv4()
     const start_time = new Date().toISOString()
-    const condition = CONDITIONS[Math.floor(Math.random() * CONDITIONS.length)]
     const scenario_order = shuffleIndices(SCENARIOS.length)
-    setSurvey({ participant_id, start_time, condition, scenario_order })
-    fetch('/api/response', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ participant_id, start_time, condition, scenario_order }),
-    }).catch(console.error)
+
+    // Sequential group assignment: count existing participants mod WLS_GROUPS
+    let group_number = 0
+    try {
+      const res = await fetch('/api/assign-group')
+      const data = await res.json()
+      group_number = data.group ?? 0
+    } catch {
+      group_number = Math.floor(Math.random() * 5)
+    }
+
+    setSurvey({ participant_id, start_time, group_number, scenario_order })
     router.push('/tech-check')
   }
 

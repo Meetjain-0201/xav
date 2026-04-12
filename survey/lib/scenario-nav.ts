@@ -1,22 +1,21 @@
 import type { Condition } from './scenarios'
 
 /**
- * Ordered steps within a single scenario loop.
- * 'reflection' shows explanation helpfulness (non-none) + anthropomorphism.
+ * Ordered steps within a single scenario loop (5 steps per scenario).
+ * - 'transparency' = perceived transparency (3 items) + cognitive load (1 item, merged)
+ * - 'reflection'   = mental model text (optional) + intentionality (4 items) + expl helpfulness (3 items, non-none)
  */
 const SCENARIO_STEPS = [
   'video',
   'comprehension',
-  's-tias',
-  'nasa-tlx',
-  'mental-model',
-  'jian-trust',
-  'reflection',
+  'trust',
+  'transparency',  // includes cognitive-load (merged)
+  'reflection',    // includes mental-model (merged)
 ] as const
 
 export type ScenarioStep = (typeof SCENARIO_STEPS)[number]
 
-export const TOTAL_SCENARIO_STEPS = SCENARIO_STEPS.length   // 7
+export const TOTAL_SCENARIO_STEPS = SCENARIO_STEPS.length   // 5
 export const TOTAL_SCENARIOS = 5
 
 /**

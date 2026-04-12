@@ -5,7 +5,7 @@ import { getSurvey, setSurvey } from '@/lib/survey-store'
 import PageWrapper from '@/components/survey/PageWrapper'
 
 const AGE_OPTIONS = ['18–24', '25–34', '35–44', '45–54', '55+']
-const GENDER_OPTIONS = ['Man', 'Woman', 'Non-binary / third gender', 'Prefer not to say']
+const GENDER_OPTIONS = ['Man', 'Woman', 'Non-binary', 'Prefer not to say']
 const EDUCATION_OPTIONS = [
   'High school diploma or equivalent',
   'Some college, no degree',

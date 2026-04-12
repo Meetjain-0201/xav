@@ -20,16 +20,21 @@ const AV_ITEMS = [
   'The benefits of autonomous vehicles outweigh the risks.',
 ]
 
+const AC1_CORRECT = 'Blue'
+const AC1_OPTIONS = ['Red', 'Green', 'Yellow', 'Blue']
+
 export default function BaselineTrustPage() {
   const router = useRouter()
   const { register, handleSubmit, formState: { errors } } = useForm()
 
   async function onSubmit(data: any) {
-    // Parse all values as numbers
-    const payload: Record<string, number> = {}
+    const payload: Record<string, any> = {}
+    // Parse Likert items as integers, keep ac1 as string (color name)
     for (const [k, v] of Object.entries(data)) {
-      payload[k] = parseInt(v as string, 10)
+      payload[k] = k === 'ac1' ? v : parseInt(v as string, 10)
     }
+    payload.attn_fail_1 = payload.ac1 !== AC1_CORRECT
+
     setSurvey(payload)
     await fetch('/api/response', {
       method: 'POST',
@@ -40,7 +45,7 @@ export default function BaselineTrustPage() {
   }
 
   return (
-    <PageWrapper title="General Attitudes" step={2} totalSteps={10}>
+    <PageWrapper title="Background" step={2} totalSteps={10}>
       <form onSubmit={handleSubmit(onSubmit)} className="space-y-8">
 
         {/* Section A — Propensity to Trust */}
@@ -57,6 +62,25 @@ export default function BaselineTrustPage() {
             register={register}
             errors={errors}
           />
+
+          {/* AC1 — Color block attention check */}
+          <div className="mt-6 border-t border-gray-100 pt-5">
+            <div className="w-14 h-14 rounded-lg bg-blue-500 mb-4" />
+            <p className="section-title mb-3">What color is the box above?</p>
+            <div className="space-y-2">
+              {AC1_OPTIONS.map((color) => (
+                <label key={color} className="radio-row">
+                  <input
+                    type="radio"
+                    value={color}
+                    {...register('ac1')}
+                    className="w-4 h-4 text-blue-600"
+                  />
+                  <span className="text-sm text-gray-700">{color}</span>
+                </label>
+              ))}
+            </div>
+          </div>
         </div>
 
         {/* Section B — AV Attitudes */}

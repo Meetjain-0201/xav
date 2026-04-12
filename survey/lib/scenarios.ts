@@ -1,5 +1,33 @@
-export type Condition = 'none' | 'template' | 'vlm_descriptive' | 'vlm_teleological'
+export type Condition = 'none' | 'vlm_descriptive' | 'vlm_teleological'
 export type Criticality = 'HIGH' | 'MEDIUM' | 'LOW'
+
+/**
+ * Williams Latin Square — 3 conditions × 5 scenario slots, 5 groups.
+ * Row = group_number (0–4), Col = scenario display slot (0–4).
+ * Each participant sees: 1× none, 2× vlm_descriptive, 2× vlm_teleological.
+ * 'none' appears in each slot position exactly once across all 5 groups.
+ * 4 participants per group → 20 participants total.
+ */
+export const WLS_MATRIX: Condition[][] = [
+  ['none',             'vlm_descriptive',  'vlm_teleological', 'vlm_descriptive',  'vlm_teleological'], // group 0
+  ['vlm_descriptive',  'none',             'vlm_teleological', 'vlm_teleological', 'vlm_descriptive' ], // group 1
+  ['vlm_teleological', 'vlm_descriptive',  'none',             'vlm_descriptive',  'vlm_teleological'], // group 2
+  ['vlm_descriptive',  'vlm_teleological', 'vlm_descriptive',  'none',             'vlm_teleological'], // group 3
+  ['vlm_teleological', 'vlm_teleological', 'vlm_descriptive',  'vlm_descriptive',  'none'            ], // group 4
+]
+
+/** Number of WLS groups */
+export const WLS_GROUPS = 5
+
+/** Get the condition for a given WLS group at a given display slot */
+export function getConditionForScenario(groupNumber: number, scenarioDisplayIndex: number): Condition {
+  return WLS_MATRIX[groupNumber][scenarioDisplayIndex]
+}
+
+/** Assign a group number sequentially / randomly for a new participant */
+export function assignGroup(): number {
+  return Math.floor(Math.random() * WLS_GROUPS)
+}
 
 export interface ComprehensionQuestion {
   name: 'comp1' | 'comp2' | 'comp3'
@@ -17,13 +45,6 @@ export interface ScenarioConfig {
   comprehension: ComprehensionQuestion[]
 }
 
-export const CONDITIONS: Condition[] = [
-  'none',
-  'template',
-  'vlm_descriptive',
-  'vlm_teleological',
-]
-
 export const SCENARIOS: ScenarioConfig[] = [
   // ── 0 ──────────────────────────────────────────────────────────────────────
   {
@@ -31,44 +52,43 @@ export const SCENARIOS: ScenarioConfig[] = [
     label: 'Urban Intersection',
     criticality: 'HIGH',
     video_ids: {
-      none:             'PLACEHOLDER_S1_NONE',
-      template:         'PLACEHOLDER_S1_TEMPLATE',
-      vlm_descriptive:  't9xGuX40Ks8',   // existing recording
-      vlm_teleological: 'PLACEHOLDER_S1_TELEOLOGICAL',
+      none:             'C3hNE1OdAk0',
+      vlm_descriptive:  'HI-ZSjl_bfc',
+      vlm_teleological: 'S8EEY3-Z4Uk',
     },
     comprehension: [
       {
         name: 'comp1',
-        question: 'Q1. What hazard did the vehicle detect in this clip?',
+        question: 'Q1. What caused the vehicle to brake suddenly?',
         options: [
-          'A cyclist running a red light',
-          'A pedestrian crossing mid-block outside the crosswalk',
-          'A delivery truck blocking the lane',
-          'A traffic signal malfunction',
+          'A cyclist ran a red light ahead',
+          'A pedestrian stepped into the road mid-block with no crosswalk',
+          'A parked car opened its door into the lane',
+          'A traffic signal turned red',
         ],
-        correct: 'A pedestrian crossing mid-block outside the crosswalk',
+        correct: 'A pedestrian stepped into the road mid-block with no crosswalk',
       },
       {
         name: 'comp2',
-        question: 'Q2. How did the vehicle respond?',
+        question: 'Q2. How did the vehicle respond to the hazard?',
         options: [
-          'It accelerated to pass before the pedestrian',
-          'It applied sudden brakes',
-          'It changed lanes to avoid the pedestrian',
-          'It honked and continued at reduced speed',
+          'It swerved into the adjacent lane',
+          'It honked and slowed gradually',
+          'It applied emergency braking',
+          'It stopped and waited for the pedestrian to pass',
         ],
-        correct: 'It applied sudden brakes',
+        correct: 'It applied emergency braking',
       },
       {
         name: 'comp3',
-        question: 'Q3. How would you describe the vehicle\'s reaction timing?',
+        question: 'Q3. How much warning did the vehicle have before the pedestrian appeared?',
         options: [
-          'It did not react at all',
-          'It reacted only after the pedestrian was directly in front',
-          'It reacted preemptively as the pedestrian entered the road',
-          'It reacted but only after a significant delay',
+          'Plenty of warning: the pedestrian was visible from a distance',
+          'Some warning: the pedestrian paused at the kerb first',
+          'No warning: the pedestrian appeared suddenly with no prior signal',
+          'The vehicle detected the pedestrian via radar before they were visible',
         ],
-        correct: 'It reacted preemptively as the pedestrian entered the road',
+        correct: 'No warning: the pedestrian appeared suddenly with no prior signal',
       },
     ],
   },
@@ -80,43 +100,42 @@ export const SCENARIOS: ScenarioConfig[] = [
     criticality: 'HIGH',
     video_ids: {
       none:             'PLACEHOLDER_S2_NONE',
-      template:         'PLACEHOLDER_S2_TEMPLATE',
       vlm_descriptive:  'PLACEHOLDER_S2_DESCRIPTIVE',
       vlm_teleological: 'PLACEHOLDER_S2_TELEOLOGICAL',
     },
     comprehension: [
       {
         name: 'comp1',
-        question: 'Q1. What event prompted the vehicle\'s action?',
+        question: 'Q1. What caused the vehicle to react in this clip?',
         options: [
-          'A traffic light turned red suddenly',
-          'The vehicle ahead braked without warning',
-          'A cyclist swerved into the lane',
-          'There was a pothole in the road',
+          'A traffic light turned red ahead',
+          'A cyclist entered the highway',
+          'The vehicle ahead came to a sudden complete stop',
+          'The road narrowed unexpectedly',
         ],
-        correct: 'The vehicle ahead braked without warning',
+        correct: 'The vehicle ahead came to a sudden complete stop',
       },
       {
         name: 'comp2',
-        question: 'Q2. What did the autonomous vehicle do in response?',
+        question: 'Q2. Which sequence best describes the vehicle\'s response?',
         options: [
-          'It swerved into the oncoming lane',
-          'It applied emergency braking',
-          'It maintained speed and used the horn',
-          'It gradually decelerated and merged right',
+          'It braked, then pulled over to the right',
+          'It braked, steered left to evade, then resumed speed',
+          'It swerved right immediately without braking',
+          'It braked and came to a full stop',
         ],
-        correct: 'It applied emergency braking',
+        correct: 'It braked, steered left to evade, then resumed speed',
       },
       {
         name: 'comp3',
-        question: 'Q3. Which best describes the gap between vehicles before and after the event?',
+        question: 'Q3. Where did this scenario take place?',
         options: [
-          'The gap stayed roughly the same',
-          'The gap increased as the AV pulled ahead',
-          'The gap shrank dangerously before the AV braked',
-          'There was no leading vehicle visible',
+          'A narrow urban street at low speed',
+          'A residential area with parked cars',
+          'A highway at approximately 60 km/h',
+          'An intersection in a city centre',
         ],
-        correct: 'The gap shrank dangerously before the AV braked',
+        correct: 'A highway at approximately 60 km/h',
       },
     ],
   },
@@ -128,43 +147,42 @@ export const SCENARIOS: ScenarioConfig[] = [
     criticality: 'MEDIUM',
     video_ids: {
       none:             'PLACEHOLDER_S4_NONE',
-      template:         'PLACEHOLDER_S4_TEMPLATE',
       vlm_descriptive:  'PLACEHOLDER_S4_DESCRIPTIVE',
       vlm_teleological: 'PLACEHOLDER_S4_TELEOLOGICAL',
     },
     comprehension: [
       {
         name: 'comp1',
-        question: 'Q1. What type of vehicle triggered the AV\'s action?',
+        question: 'Q1. What triggered the vehicle\'s lane change in this clip?',
         options: [
-          'A police car on a routine patrol',
-          'An ambulance or fire truck with sirens active',
-          'A construction vehicle',
-          'A school bus with flashing lights',
+          'A red traffic light ahead',
+          'A pedestrian stepping off the kerb',
+          'An emergency vehicle approaching from behind with lights and sirens',
+          'Roadworks blocking the current lane',
         ],
-        correct: 'An ambulance or fire truck with sirens active',
+        correct: 'An emergency vehicle approaching from behind with lights and sirens',
       },
       {
         name: 'comp2',
         question: 'Q2. What did the autonomous vehicle do?',
         options: [
-          'It stopped immediately in the middle of the lane',
+          'It stopped in the middle of the road',
           'It accelerated to clear the road faster',
-          'It moved toward the curb and slowed to yield',
-          'It changed to the left lane to give way',
+          'It moved to the left lane',
+          'It pulled over to the right side and yielded the lane',
         ],
-        correct: 'It moved toward the curb and slowed to yield',
+        correct: 'It pulled over to the right side and yielded the lane',
       },
       {
         name: 'comp3',
-        question: 'Q3. What happened after the emergency vehicle passed?',
+        question: 'Q3. Why might this manoeuvre seem unexpected to a passenger?',
         options: [
-          'It turned on hazard lights and waited',
-          'It resumed normal speed',
-          'It parked and powered down',
-          'It was still pulled over at the end of the clip',
+          'Because the vehicle exceeded the speed limit',
+          'Because there was no visible obstacle or hazard ahead of the vehicle',
+          'Because the vehicle ignored a traffic signal',
+          'Because the vehicle moved in the wrong direction',
         ],
-        correct: 'It resumed normal speed',
+        correct: 'Because there was no visible obstacle or hazard ahead of the vehicle',
       },
     ],
   },
@@ -176,43 +194,42 @@ export const SCENARIOS: ScenarioConfig[] = [
     criticality: 'HIGH',
     video_ids: {
       none:             'PLACEHOLDER_S5V2_NONE',
-      template:         'PLACEHOLDER_S5V2_TEMPLATE',
       vlm_descriptive:  'PLACEHOLDER_S5V2_DESCRIPTIVE',
       vlm_teleological: 'PLACEHOLDER_S5V2_TELEOLOGICAL',
     },
     comprehension: [
       {
         name: 'comp1',
-        question: 'Q1. What made this scenario particularly challenging for the vehicle?',
+        question: 'Q1. Where did the cyclist emerge from?',
         options: [
-          'The road was icy and slippery',
-          'The cyclist emerged from an occluded area between parked cars',
-          'The cyclist was travelling at high speed on the main road',
-          'Sun glare obscured the sensors',
+          'A marked bicycle lane on the left',
+          'A blind spot behind a parked vehicle or building corner',
+          'A side street with a stop sign',
+          'The pavement on the right',
         ],
-        correct: 'The cyclist emerged from an occluded area between parked cars',
+        correct: 'A blind spot behind a parked vehicle or building corner',
       },
       {
         name: 'comp2',
-        question: 'Q2. What did the vehicle do when the cyclist appeared?',
+        question: 'Q2. How did the vehicle respond when the cyclist appeared?',
         options: [
-          'It swerved fully into the opposite lane',
-          'It continued at speed, relying on the cyclist to avoid it',
-          'It braked sharply and steered slightly away',
-          'It stopped completely and waited',
+          'It swerved into the opposite lane',
+          'It continued at speed, relying on the cyclist to move',
+          'It applied emergency braking',
+          'It slowed gradually and pulled over',
         ],
-        correct: 'It braked sharply and steered slightly away',
+        correct: 'It applied emergency braking',
       },
       {
         name: 'comp3',
-        question: 'Q3. Which word best describes the nature of this hazard?',
+        question: 'Q3. What made this hazard harder to anticipate than a typical one?',
         options: [
-          'Predictable — the cyclist followed traffic rules',
-          'Ambiguous — the cyclist\'s path was unclear',
-          'Occluded — the cyclist was hidden until the last moment',
-          'Deliberate — the cyclist was testing the vehicle',
+          'The road was wet and reduced stopping distance',
+          'The cyclist was travelling unusually fast',
+          'There was no line of sight to the cyclist before they appeared',
+          'The vehicle\'s sensors were blocked by sunlight',
         ],
-        correct: 'Occluded — the cyclist was hidden until the last moment',
+        correct: 'There was no line of sight to the cyclist before they appeared',
       },
     ],
   },
@@ -224,43 +241,42 @@ export const SCENARIOS: ScenarioConfig[] = [
     criticality: 'LOW',
     video_ids: {
       none:             'PLACEHOLDER_L3_NONE',
-      template:         'PLACEHOLDER_L3_TEMPLATE',
       vlm_descriptive:  'PLACEHOLDER_L3_DESCRIPTIVE',
       vlm_teleological: 'PLACEHOLDER_L3_TELEOLOGICAL',
     },
     comprehension: [
       {
         name: 'comp1',
-        question: 'Q1. What driving challenge did the vehicle face in this clip?',
+        question: 'Q1. What was the road condition in this clip?',
         options: [
-          'A flooded road section',
-          'Navigating a narrow street with parked cars on both sides',
-          'A sudden detour due to road works',
-          'A sharp blind corner at speed',
+          'A wide multi-lane road with light traffic',
+          'A highway on-ramp',
+          'A narrow urban street with parked cars on both sides',
+          'A road under construction with cones',
         ],
-        correct: 'Navigating a narrow street with parked cars on both sides',
+        correct: 'A narrow urban street with parked cars on both sides',
       },
       {
         name: 'comp2',
-        question: 'Q2. How did the autonomous vehicle handle the narrow passage?',
+        question: 'Q2. How did the vehicle navigate the street?',
         options: [
-          'It stopped and waited for assistance',
-          'It accelerated through the gap quickly',
-          'It slowed down and carefully navigated through',
+          'It stopped and waited for oncoming traffic to clear',
+          'It accelerated quickly to get through the narrow section',
           'It reversed and found a different route',
+          'It slowed down and carefully drove through at low speed',
         ],
-        correct: 'It slowed down and carefully navigated through',
+        correct: 'It slowed down and carefully drove through at low speed',
       },
       {
         name: 'comp3',
-        question: 'Q3. Which best describes the vehicle\'s overall behavior in this clip?',
+        question: 'Q3. How does this clip differ from the other scenarios in the study?',
         options: [
-          'Erratic — it made multiple unnecessary maneuvers',
-          'Cautious and deliberate — it prioritized safety over speed',
-          'Aggressive — it forced a path through',
-          'Indecisive — it started and stopped multiple times',
+          'The vehicle travelled faster than in the other clips',
+          'No emergency event occurred: the vehicle drove normally and predictably',
+          'The vehicle had to stop completely for an obstacle',
+          'A passenger intervened to take control',
         ],
-        correct: 'Cautious and deliberate — it prioritized safety over speed',
+        correct: 'No emergency event occurred: the vehicle drove normally and predictably',
       },
     ],
   },
