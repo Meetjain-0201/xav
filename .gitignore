@@ -1,11 +1,23 @@
 # Secrets
 .env
+.env.local
+survey/.env
+survey/.next/
+survey/node_modules/
+survey/next-env.d.ts
+survey/tsconfig.tsbuildinfo
 
 # Recorded data (too large for git — use external storage)
 data/scenarios/
 data/explanations/
 
-viz/node_modules
+# Viz — Next.js dashboard
+viz/node_modules/
+viz/.next/
+viz/.env.local
+viz/.env
+viz/next-env.d.ts
+viz/tsconfig.tsbuildinfo
 
 # ML model weights (downloaded automatically by ultralytics)
 *.pt
